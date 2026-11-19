@@ -31,6 +31,7 @@
   #playBtn { width:38px; padding:6px 0; }
   #slider { flex:1; accent-color:var(--fg); min-width:60px; }
 
+  #resetBtn { position:fixed; right:20px; top:56px; background:#141416cc; backdrop-filter:blur(14px); }
   #hint { position:fixed; right:20px; top:18px; color:var(--dim); font-size:12px; text-align:right; pointer-events:none; text-shadow:0 1px 10px #000a; }
   body[data-mode="free"] .tour-hint, body[data-mode="tour"] .free-hint { display:none; }
 
@@ -48,6 +49,7 @@
 </head>
 <body data-mode="free">
   <div id="title"></div>
+  <button id="resetBtn" title="Back to the start (R)">↺ Reset</button>
   <div id="hint">
     <span class="tour-hint">Scroll or swipe to move · drag to look around</span>
     <span class="free-hint">W A S D to move · Q / E down / up · drag to look · scroll = speed</span>
@@ -64,6 +66,7 @@
     <div class="row"><span><kbd>Space</kbd> drop a point</span><span><kbd>⌫</kbd> undo · <kbd>⇧⌫</kbd> clear</span></div>
     <div class="row"><span><kbd>P</kbd> preview</span><span><kbd>T</kbd> fly / preview</span></div>
     <div class="row"><span><kbd>O</kbd> fix orientation</span><span><kbd>X</kbd> save path.json</span></div>
+    <div class="row"><span><kbd>R</kbd> reset to start</span><span><kbd>G</kbd> ground lock</span></div>
   </div>
 
   <div id="flash"></div>

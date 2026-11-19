@@ -134,6 +134,102 @@ camera.far = diag * 20;
 camera.updateProjectionMatrix();
 
 /* ------------------------------------------------------------------ *
+ *  Ground: heightfield built from the splats so you can't fly under the floor
+ * ------------------------------------------------------------------ */
+const GROUND = { on: true };
+let floorGrid = null;
+let clearance = 0.3;
+
+function buildFloor() {
+  try {
+    const stride = Math.max(1, Math.floor(mesh.numSplats / 250000));
+    const cs = Math.max(diag * 0.012, 0.05);
+    clearance = Math.max(diag * 0.02, 0.15);
+    const cells = new Map();
+    const v = new THREE.Vector3();
+    mesh.forEachSplat((i, c, s, q, o) => {
+      if (i % stride !== 0 || o < 0.3) return;
+      v.copy(c).applyQuaternion(mesh.quaternion);
+      const key = Math.floor(v.x / cs) + "," + Math.floor(v.z / cs);
+      let a = cells.get(key);
+      if (!a) cells.set(key, (a = []));
+      a.push(v.y);
+    });
+    // per-cell floor = low percentile of heights; ignore sparse cells (floaters)
+    let i0 = Infinity, i1 = -Infinity, j0 = Infinity, j1 = -Infinity;
+    const floors = new Map();
+    for (const [key, a] of cells) {
+      if (a.length < 6) continue;
+      a.sort((p, q) => p - q);
+      const [ix, iz] = key.split(",").map(Number);
+      floors.set(key, a[Math.floor(0.12 * (a.length - 1))]);
+      i0 = Math.min(i0, ix); i1 = Math.max(i1, ix);
+      j0 = Math.min(j0, iz); j1 = Math.max(j1, iz);
+    }
+    if (!floors.size) return;
+    const w = Math.min(i1 - i0 + 1, 1500), h = Math.min(j1 - j0 + 1, 1500);
+    const vals = [...floors.values()].sort((p, q) => p - q);
+    const globalFloor = vals[Math.floor(0.2 * (vals.length - 1))];
+    const data = new Float32Array(w * h).fill(NaN);
+    for (const [key, f] of floors) {
+      const [ix, iz] = key.split(",").map(Number);
+      const x = ix - i0, z = iz - j0;
+      if (x >= 0 && x < w && z >= 0 && z < h) data[z * w + x] = f;
+    }
+    // fill holes from nearby cells, else the global floor
+    const filled = new Float32Array(data);
+    for (let z = 0; z < h; z++) {
+      for (let x = 0; x < w; x++) {
+        if (!Number.isNaN(data[z * w + x])) continue;
+        let sum = 0, cnt = 0;
+        for (let dz = -3; dz <= 3; dz++) {
+          for (let dx = -3; dx <= 3; dx++) {
+            const xx = x + dx, zz = z + dz;
+            if (xx < 0 || zz < 0 || xx >= w || zz >= h) continue;
+            const f = data[zz * w + xx];
+            if (!Number.isNaN(f)) { sum += f; cnt++; }
+          }
+        }
+        filled[z * w + x] = cnt ? sum / cnt : globalFloor;
+      }
+    }
+    // light smoothing so the camera glides over bumps
+    const smooth = new Float32Array(filled.length);
+    for (let z = 0; z < h; z++) {
+      for (let x = 0; x < w; x++) {
+        let sum = 0, cnt = 0;
+        for (let dz = -1; dz <= 1; dz++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            const xx = x + dx, zz = z + dz;
+            if (xx < 0 || zz < 0 || xx >= w || zz >= h) continue;
+            sum += filled[zz * w + xx]; cnt++;
+          }
+        }
+        smooth[z * w + x] = sum / cnt;
+      }
+    }
+    floorGrid = { cs, i0, j0, w, h, data: smooth, globalFloor };
+  } catch (e) {
+    console.warn("floor build failed", e);
+    floorGrid = null;
+  }
+}
+
+function floorAt(x, z) {
+  const g = floorGrid;
+  if (!g) return -Infinity;
+  const fx = x / g.cs - g.i0 - 0.5, fz = z / g.cs - g.j0 - 0.5;
+  const x0 = Math.floor(fx), z0 = Math.floor(fz);
+  const tx = fx - x0, tz = fz - z0;
+  const at = (i, j) => (i < 0 || j < 0 || i >= g.w || j >= g.h ? g.globalFloor : g.data[j * g.w + i]);
+  const a = at(x0, z0) * (1 - tx) + at(x0 + 1, z0) * tx;
+  const b = at(x0, z0 + 1) * (1 - tx) + at(x0 + 1, z0 + 1) * tx;
+  return a * (1 - tz) + b * tz;
+}
+
+buildFloor();
+
+/* ------------------------------------------------------------------ *
  *  Camera state
  * ------------------------------------------------------------------ */
 let mode = "free"; // "free" | "tour"
@@ -337,6 +433,7 @@ canvas.addEventListener(
 window.addEventListener("keydown", (e) => {
   if (e.target instanceof HTMLInputElement) return;
   const k = e.key.toLowerCase();
+  if (k === "r" && !e.ctrlKey && !e.metaKey) return resetView();
   if (mode === "free") {
     if (["w", "a", "s", "d", "q", "e", "shift"].includes(k)) keys.add(k);
   }
@@ -356,6 +453,10 @@ window.addEventListener("keydown", (e) => {
       return;
     }
     if (k === "o") return cycleOrientation();
+    if (k === "g") {
+      GROUND.on = !GROUND.on;
+      return hudFlash("Ground lock " + (GROUND.on ? "on" : "off"));
+    }
     if (k === "t") return setMode(mode === "tour" ? "free" : "tour");
     if (k === "p") {
       if (!curve) return;
@@ -417,6 +518,33 @@ $("slider").addEventListener("input", (e) => {
   $("playBtn").textContent = "▶";
 });
 
+function resetView() {
+  if (mode === "tour") {
+    tourU = tourTarget = 0;
+    playing = false;
+    lookYaw = lookPitch = 0;
+    $("playBtn").textContent = "▶";
+    $("slider").value = 0;
+  } else {
+    const w = pathData.waypoints[0];
+    if (w) {
+      camera.position.set(...w.p);
+      camera.quaternion.set(...w.q);
+    } else {
+      camera.position.copy(defaultStart.p);
+      camera.quaternion.copy(defaultStart.q);
+    }
+    syncYawPitchFromCamera();
+    vel.set(0, 0, 0);
+  }
+  hudFlash("Back to the start");
+}
+$("resetBtn").addEventListener("click", resetView);
+// keep keyboard focus off buttons so Space never "clicks" them
+document.addEventListener("click", (e) => {
+  if (e.target instanceof HTMLButtonElement) e.target.blur();
+});
+
 function addWaypoint() {
   pathData.waypoints.push({
     p: camera.position.toArray().map((v) => +v.toFixed(5)),
@@ -440,6 +568,7 @@ function cycleOrientation() {
   });
   save();
   rebuildPath();
+  buildFloor();
   hudFlash("Orientation " + (pathData.orientation + 1) + " / " + ORIENTATIONS.length);
 }
 
@@ -493,6 +622,13 @@ function frame(now) {
     if (wish.lengthSq() > 0) wish.normalize().multiplyScalar(s);
     vel.lerp(wish, 1 - Math.exp(-dt * 10));
     camera.position.addScaledVector(vel, dt);
+    if (GROUND.on && floorGrid) {
+      const minY = floorAt(camera.position.x, camera.position.z) + clearance;
+      if (camera.position.y < minY) {
+        camera.position.y += (minY - camera.position.y) * Math.min(1, dt * 15);
+        if (vel.y < 0) vel.y = 0;
+      }
+    }
   } else if (curve) {
     if (playing) {
       tourTarget = Math.min(1, tourTarget + dt / Math.max(pathData.duration, 5));
@@ -523,6 +659,7 @@ function frame(now) {
  * ------------------------------------------------------------------ */
 rebuildPath();
 startPose();
+const defaultStart = { p: camera.position.clone(), q: camera.quaternion.clone() };
 if (curve && !AUTHOR) setMode("tour");
 else setMode("free");
 renderer.setAnimationLoop(frame);
