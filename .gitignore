@@ -1,0 +1,11 @@
+# big splat data lives on Cloudflare R2, not in git
+*.ply
+*.sog
+*.spz
+*.log
+convert.bat
+make-web.bat
+build-hq.bat
+spz-hq.bat
+info2.bat
+info-orig.bat
