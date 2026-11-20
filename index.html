@@ -63,8 +63,23 @@
   #playBtn { width:38px; padding:6px 0; }
   #slider { flex:1; accent-color:var(--fg); min-width:60px; }
 
-  #resetBtn { position:fixed; right:20px; top:56px; background:#141416cc; backdrop-filter:blur(14px); }
   #editBtn { position:fixed; right:20px; top:96px; background:#141416cc; backdrop-filter:blur(14px); }
+  body:not(.author) #ptsBtn { top:56px; }
+  body:not(.author) #pts { top:96px; }
+  body.previewing #ptsBtn { top:96px; }
+  body.previewing #pts { top:136px; }
+  body.chapters #marks { display:block; }
+  body.chapters:not(.author) #track { height:50px; }
+  .ch { position:absolute; top:14px; transform:translateX(-50%); pointer-events:auto; cursor:pointer; padding:4px 6px; }
+  .ch i { display:block; width:14px; height:14px; border-radius:50%; background:#fff; border:2px solid #111; transition:.15s; }
+  .ch span { position:absolute; bottom:30px; left:50%; transform:translateX(-50%); background:#141416f2; border:1px solid #ffffff1f; padding:3px 9px;
+    border-radius:6px; font-size:12px; white-space:nowrap; opacity:0; pointer-events:none; transition:.15s; }
+  .ch:hover span { opacity:1; }
+  .ch:hover i { transform:scale(1.3); background:var(--accent); }
+  #prevBtn { position:fixed; right:20px; top:56px; background:#141416cc; backdrop-filter:blur(14px); }
+  #paceBtn { position:fixed; right:122px; top:56px; background:#141416cc; backdrop-filter:blur(14px); }
+  body.previewing #paceBtn { display:none; }
+  #prevBtn.on { background:var(--accent); color:#111; }
   #ptsBtn.on, #editBtn.on { background:var(--accent); color:#111; }
   body.editing canvas { cursor:crosshair; }
   #hint { position:fixed; right:20px; top:18px; color:var(--dim); font-size:12px; text-align:right; pointer-events:none; text-shadow:0 1px 10px #000a; }
@@ -85,10 +100,11 @@
 </head>
 <body data-mode="free">
   <div id="title"></div>
+  <button id="paceBtn" hidden title="Spread the points over a set time with comfortable speed and turns">⏱ Auto-pace</button>
+  <button id="prevBtn" hidden title="See what visitors will see">👁 Preview</button>
   <button id="ptsBtn" hidden title="List of points (L)">☰ Points</button>
   <div id="pts" hidden></div>
   <button id="editBtn" hidden title="Edit the path (M)">✎ Edit path</button>
-  <button id="resetBtn" title="Back to the start (R)">↺ Reset</button>
   <div id="hint">
     <span class="tour-hint">Scroll or swipe to move · drag to look around</span>
     <span class="free-hint">W A S D to move · Q / E down / up · drag to look · scroll = speed</span>
@@ -98,13 +114,14 @@
     <button id="playBtn" title="Play / pause">▶</button>
     <div id="track"><div id="marks"></div><input id="slider" type="range" min="0" max="1000" value="0" aria-label="Position along the tour"></div>
     <span id="clock"></span>
+    <button id="resetBtn" title="Back to the start (R)">↺ Reset</button>
     <button id="modeBtn">Explore freely</button>
   </div>
 
   <div id="author" hidden>
     <div class="head"><b>Author mode</b><span><span id="count">0 points</span> · <span id="modeLabel">free fly</span></span></div>
-    <div class="row"><span><kbd>Space</kbd> drop a point <small style="opacity:.6">(over the playbar: play / pause)</small></span><span><kbd>⌫</kbd> undo · <kbd>⇧⌫</kbd> clear</span></div>
-    <div class="row"><span><kbd>P</kbd> preview</span><span><kbd>T</kbd> fly / preview</span></div>
+    <div class="row"><span><kbd>P</kbd> or <kbd>Space</kbd> drop a point <small style="opacity:.6">(over the playbar: play / pause)</small></span><span><kbd>⌫</kbd> undo · <kbd>⇧⌫</kbd> clear</span></div>
+    <div class="row"><span><kbd>⇧P</kbd> play preview</span><span><kbd>T</kbd> fly / preview</span></div>
     <div class="row"><span><kbd>O</kbd> fix orientation</span><span><kbd>X</kbd> save path.json</span></div>
     <div class="row"><span><kbd>R</kbd> reset to start</span><span><kbd>G</kbd> ground lock</span></div>
     <div class="sep"></div>

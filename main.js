@@ -6,6 +6,7 @@ import { SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
  * ------------------------------------------------------------------ */
 const params = new URLSearchParams(location.search);
 const AUTHOR = params.has("author");
+let preview = false; // author page: showing the visitor view
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 const STORE_KEY = "china26-path-v2";
@@ -292,14 +293,34 @@ let curve = null;
 let wpU = []; // arc-length parameter of each waypoint (where it sits on the route)
 let wpT = []; // timeline position of each waypoint, 0..1 (auto = wpU, or a custom w.t you dragged)
 // timeline position -> position along the route (piecewise between waypoints, so each point lands on its own time)
+let wpM = []; // slopes for the smooth timeline mapping
+function buildTimeMap() {
+  const n = wpT.length;
+  wpM = [];
+  if (n < 2) return;
+  const d = [];
+  for (let i = 0; i < n - 1; i++) d.push((wpU[i + 1] - wpU[i]) / Math.max(wpT[i + 1] - wpT[i], 1e-6));
+  wpM = new Array(n);
+  wpM[0] = d[0];
+  wpM[n - 1] = d[n - 2];
+  for (let i = 1; i < n - 1; i++) wpM[i] = d[i - 1] * d[i] > 0 ? (d[i - 1] + d[i]) / 2 : 0;
+  for (let i = 0; i < n - 1; i++) {
+    if (d[i] === 0) { wpM[i] = wpM[i + 1] = 0; continue; }
+    const a = wpM[i] / d[i], b = wpM[i + 1] / d[i], s = a * a + b * b;
+    if (s > 9) { const k = 3 / Math.sqrt(s); wpM[i] = k * a * d[i]; wpM[i + 1] = k * b * d[i]; }
+  }
+}
+// timeline position -> position along the route. Monotone cubic, so the speed changes smoothly at points instead of jumping.
 function tlToU(x) {
   const n = wpT.length;
   if (n < 2) return x;
   x = clamp(x, 0, 1);
   let j = 0;
   while (j < n - 2 && x > wpT[j + 1]) j++;
-  const f = clamp((x - wpT[j]) / Math.max(wpT[j + 1] - wpT[j], 1e-6), 0, 1);
-  return wpU[j] + f * (wpU[j + 1] - wpU[j]);
+  const h = Math.max(wpT[j + 1] - wpT[j], 1e-6);
+  const t = clamp((x - wpT[j]) / h, 0, 1), t2 = t * t, t3 = t2 * t;
+  const u = (2 * t3 - 3 * t2 + 1) * wpU[j] + (t3 - 2 * t2 + t) * h * wpM[j] + (-2 * t3 + 3 * t2) * wpU[j + 1] + (t3 - t2) * h * wpM[j + 1];
+  return clamp(u, 0, 1);
 }
 const T_GAP = 0.004;
 let pathLine = null;
@@ -419,18 +440,65 @@ function makeBall(num, colorHex, sel) {
 }
 
 const fmtT = (s) => Math.floor(s / 60) + ":" + String(Math.floor(s % 60)).padStart(2, "0");
+// Jump the tour straight to a point on the timeline: no easing, no leftover look-around, so the view is the
+// same one the editor shows for that point.
+function snapTour(u) {
+  tourTarget = tourU = u;
+  lookYaw = lookPitch = 0;
+  samplePathT(u, _p, _pq);
+  camera.position.copy(_p);
+  camera.quaternion.copy(_pq);
+  $("slider").value = Math.round(u * 1000);
+}
 function jumpTo(i) {
   const wps = pathData.waypoints;
   if (!wps[i]) return;
   selectPoint(i);
   if (mode === "tour" && wpT[i] != null) {
-    tourTarget = wpT[i];
+    snapTour(wpT[i]);
     playing = false;
     $("playBtn").textContent = "▶";
   } else viewFrom(i);
 }
+// Visitor view: only the points you gave a name become chapters, on the timeline and in a small menu.
+function renderChapters() {
+  const wps = pathData.waypoints, dur = pathData.duration;
+  const named = curve ? wps.map((w, i) => ({ w, i })).filter((x) => x.w.name) : [];
+  const btn = $("ptsBtn"), list = $("pts"), marks = $("marks");
+  marks.innerHTML = "";
+  list.innerHTML = "";
+  document.body.classList.toggle("chapters", named.length > 0);
+  btn.hidden = named.length === 0;
+  if (!named.length) {
+    list.hidden = true;
+    return;
+  }
+  named.forEach(({ w, i }, k) => {
+    const u = wpT[i] ?? 0;
+    const go = () => {
+      if (mode !== "tour") setMode("tour");
+      snapTour(u);
+      list.hidden = true;
+      btn.classList.remove("on");
+    };
+    const mk = document.createElement("div");
+    mk.className = "ch";
+    mk.style.left = "calc(8px + (100% - 16px) * " + u + ")";
+    mk.innerHTML = "<i></i><span></span>";
+    mk.lastChild.textContent = w.name + " · " + fmtT(u * dur);
+    mk.addEventListener("click", go);
+    marks.appendChild(mk);
+    const row = document.createElement("div");
+    row.className = "pt";
+    row.innerHTML = "<b>" + (k + 1) + "</b><span class=\"nm\"></span><em>" + fmtT(u * dur) + "</em>";
+    row.querySelector(".nm").textContent = w.name;
+    row.addEventListener("click", go);
+    list.appendChild(row);
+  });
+}
+
 function renderTimeline() {
-  if (!AUTHOR) return;
+  if (!AUTHOR || preview) return renderChapters();
   const wps = pathData.waypoints,
     n = wps.length,
     dur = pathData.duration;
@@ -555,10 +623,11 @@ function renderTimeline() {
 // The route is a chain of cubic bezier segments. Each point has one smooth tangent handle H:
 // the curve leaves the point along +H and arrives along +H, so dragging it bends the path there.
 class BezierPath extends THREE.Curve {
-  constructor(pts, hs) {
+  constructor(pts, hs, hi) {
     super();
     this.pts = pts;
-    this.hs = hs;
+    this.hs = hs; // leaving handle of each point
+    this.hi = hi || hs; // arriving handle of each point
   }
   getPoint(t, target = new THREE.Vector3()) {
     const n = this.pts.length - 1;
@@ -567,7 +636,7 @@ class BezierPath extends THREE.Curve {
     const f = s - i, g = 1 - f;
     const p0 = this.pts[i], p3 = this.pts[i + 1];
     const p1 = _b1.copy(p0).add(this.hs[i]);
-    const p2 = _b2.copy(p3).sub(this.hs[i + 1]);
+    const p2 = _b2.copy(p3).sub(this.hi[i + 1]);
     const a = g * g * g, b = 3 * g * g * f, c = 3 * g * f * f, d = f * f * f;
     return target.set(
       a * p0.x + b * p1.x + c * p2.x + d * p3.x,
@@ -577,28 +646,43 @@ class BezierPath extends THREE.Curve {
   }
 }
 const _b1 = new THREE.Vector3(), _b2 = new THREE.Vector3();
-// automatic handle for point i (used until you drag it): smooth, and scaled to the nearer neighbour so it never overshoots
-function autoHandle(i, pts) {
-  const n = pts.length;
-  const prev = pts[Math.max(i - 1, 0)], next = pts[Math.min(i + 1, n - 1)];
-  const dir = next.clone().sub(prev);
-  if (dir.lengthSq() < 1e-12) return new THREE.Vector3();
+// automatic handles (used until you drag one): the path leaves and arrives along one smooth direction, and each side is
+// a third of the distance to that side's neighbour, so a short hop never squeezes the curve into a sharp corner
+function autoHandles(i, pts) {
+  const n = pts.length, p = pts[i];
+  const dl = i > 0 ? p.distanceTo(pts[i - 1]) : 0, dr = i < n - 1 ? p.distanceTo(pts[i + 1]) : 0;
+  const dir = new THREE.Vector3();
+  if (i > 0 && dl > 1e-9) dir.add(p.clone().sub(pts[i - 1]).divideScalar(dl));
+  if (i < n - 1 && dr > 1e-9) dir.add(pts[i + 1].clone().sub(p).divideScalar(dr));
+  if (dir.lengthSq() < 1e-12) return { out: new THREE.Vector3(), inn: new THREE.Vector3() };
   dir.normalize();
-  const dl = i > 0 ? pts[i].distanceTo(pts[i - 1]) : Infinity;
-  const dr = i < n - 1 ? pts[i].distanceTo(pts[i + 1]) : Infinity;
-  return dir.multiplyScalar(Math.min(dl, dr) / 3);
+  return { out: dir.clone().multiplyScalar(dr / 3), inn: dir.clone().multiplyScalar(dl / 3) };
 }
 function handleVecs(wps) {
   const pts = wps.map((w) => new THREE.Vector3(...w.p));
-  return { pts, hs: wps.map((w, i) => (w.h ? new THREE.Vector3(...w.h) : autoHandle(i, pts))) };
+  const out = [], inn = [];
+  wps.forEach((w, i) => {
+    if (w.h) {
+      // your handle sets the direction and strength, but is capped to 60% of the way to each neighbour so it cannot loop the path
+      const v = new THREE.Vector3(...w.h);
+      const dl = i > 0 ? pts[i].distanceTo(pts[i - 1]) : Infinity, dr = i < pts.length - 1 ? pts[i].distanceTo(pts[i + 1]) : Infinity;
+      out.push(v.clone().clampLength(0, 0.6 * dr));
+      inn.push(v.clone().clampLength(0, 0.6 * dl));
+    } else {
+      const a = autoHandles(i, pts);
+      out.push(a.out);
+      inn.push(a.inn);
+    }
+  });
+  return { pts, hs: out, hi: inn };
 }
 // the two handle ends of a point (forward = +H, back = -H), for drawing and picking
 function tangentEnds(i, out) {
   const wps = pathData.waypoints;
-  const { pts, hs } = handleVecs(wps);
+  const { pts, hs, hi } = handleVecs(wps);
   const p = pts[i];
   out.fwd = p.clone().add(hs[i]);
-  out.back = p.clone().sub(hs[i]);
+  out.back = p.clone().sub(hi[i]);
   return out;
 }
 function makeTangentHandle() {
@@ -645,8 +729,8 @@ function rebuildPath() {
   disposeGroup(markers);
   if (selected >= wps.length) selected = wps.length - 1;
   if (wps.length >= 2) {
-    const { pts, hs } = handleVecs(wps);
-    curve = new BezierPath(pts, hs);
+    const { pts, hs, hi } = handleVecs(wps);
+    curve = new BezierPath(pts, hs, hi);
     const per = 100;
     curve.arcLengthDivisions = (wps.length - 1) * per;
     curve.updateArcLengths();
@@ -659,6 +743,9 @@ function rebuildPath() {
     const N = wps.length;
     wpT = wps.map((w, i) => (i === 0 ? 0 : i === N - 1 ? 1 : w.t ?? wpU[i]));
     for (let i = 1; i < N - 1; i++) wpT[i] = clamp(wpT[i], wpT[i - 1] + T_GAP, 1 - T_GAP * (N - 1 - i));
+    buildTimeMap();
+    buildRotations(wps);
+    buildTracks();
   }
   if (AUTHOR) {
     const r = diag * 0.005;
@@ -754,6 +841,160 @@ function rebuildPath() {
 
 const _q0 = new THREE.Quaternion();
 const _q1 = new THREE.Quaternion();
+// Camera rotation between points: SQUAD (a smooth quaternion spline) instead of an ease-in/out at every point,
+// so the view keeps turning steadily through a point rather than stopping and starting.
+let rotQ = [], rotS = [];
+const qLog = (q) => {
+  const s = Math.hypot(q.x, q.y, q.z);
+  if (s < 1e-9) return new THREE.Vector3();
+  const a = Math.atan2(s, q.w) / s;
+  return new THREE.Vector3(q.x * a, q.y * a, q.z * a);
+};
+const qExp = (v) => {
+  const a = v.length();
+  if (a < 1e-9) return new THREE.Quaternion();
+  const s = Math.sin(a) / a;
+  return new THREE.Quaternion(v.x * s, v.y * s, v.z * s, Math.cos(a));
+};
+function buildRotations(wps) {
+  const n = wps.length;
+  rotQ = wps.map((w) => new THREE.Quaternion(...w.q).normalize());
+  for (let i = 1; i < n; i++) if (rotQ[i].dot(rotQ[i - 1]) < 0) rotQ[i].set(-rotQ[i].x, -rotQ[i].y, -rotQ[i].z, -rotQ[i].w);
+  rotS = rotQ.map((q, i) => {
+    const inv = q.clone().invert();
+    const l1 = i < n - 1 ? qLog(inv.clone().multiply(rotQ[i + 1])) : new THREE.Vector3();
+    const l0 = i > 0 ? qLog(inv.clone().multiply(rotQ[i - 1])) : new THREE.Vector3();
+    return q.clone().multiply(qExp(l1.add(l0).multiplyScalar(-0.25)));
+  });
+}
+const _qa = new THREE.Quaternion(), _qb = new THREE.Quaternion();
+// Both the camera position and the view direction are laid out over the timeline and then low-pass filtered, so neither can
+// snap: sharp corners and sudden turns are rounded off into steady, gradual motion. Filtering forward and then backward
+// means no lag; the ends are held so the first and last views stay as authored.
+let rotTrack = null, posTrack = null, rotM = 0;
+const ROT_HZ = 30, ROT_TAU = 0.9, POS_TAU = 1.2; // samples per second; smoothing time (seconds) for view / position
+function buildTracks() {
+  const n = pathData.waypoints.length;
+  rotTrack = posTrack = null;
+  if (n < 2 || !curve) return;
+  const dur = Math.max(pathData.duration, 2);
+  const M = Math.max(8, Math.ceil(dur * ROT_HZ) + 1);
+  const qs = [], ps = [];
+  let j = 0;
+  for (let k = 0; k < M; k++) {
+    const x = k / (M - 1);
+    while (j < n - 2 && x > wpT[j + 1]) j++;
+    const f = clamp((x - wpT[j]) / Math.max(wpT[j + 1] - wpT[j], 1e-6), 0, 1);
+    const q = rotQ[j].clone().slerp(rotQ[j + 1], f);
+    if (k > 0 && q.dot(qs[k - 1]) < 0) q.set(-q.x, -q.y, -q.z, -q.w);
+    qs.push(q);
+    ps.push(curve.getPointAt(clamp(tlToU(x), 0, 1), new THREE.Vector3()));
+  }
+  const pad = Math.ceil(ROT_HZ * 3 * Math.max(ROT_TAU, POS_TAU));
+  const ext = (arr) => [...Array(pad).fill(arr[0]), ...arr, ...Array(pad).fill(arr[arr.length - 1])].map((v) => v.clone());
+  const aR = 1 - Math.exp(-1 / ROT_HZ / ROT_TAU), aP = 1 - Math.exp(-1 / ROT_HZ / POS_TAU);
+  const Q = ext(qs), P = ext(ps), L = Q.length;
+  for (let round = 0; round < 2; round++) {
+    for (let k = 1; k < L; k++) { Q[k] = Q[k - 1].clone().slerp(Q[k], aR); P[k] = P[k - 1].clone().lerp(P[k], aP); }
+    for (let k = L - 2; k >= 0; k--) { Q[k] = Q[k + 1].clone().slerp(Q[k], aR); P[k] = P[k + 1].clone().lerp(P[k], aP); }
+  }
+  rotTrack = Q.slice(pad, pad + M);
+  posTrack = P.slice(pad, pad + M);
+  rotM = M;
+  // Smoothing spreads the turns on either side of a point into the stretch between them. Where two neighbouring points
+  // have (almost) the same view, hold that view through the middle of the stretch and only ease in and out at its ends.
+  for (let i = 0; i < n - 1; i++) {
+    if (rotQ[i].angleTo(rotQ[i + 1]) > 0.07) continue; // more than about 4 degrees apart: a real turn
+    const s0 = clamp(wpT[i], 0, 1) * (M - 1), s1 = clamp(wpT[i + 1], 0, 1) * (M - 1);
+    const ramp = Math.min(ROT_HZ * 2.0, (s1 - s0) / 2);
+    if (ramp < 1) continue;
+    for (let k = Math.ceil(s0); k <= Math.floor(s1); k++) {
+      const x = Math.min(k - s0, s1 - k) / ramp;
+      const w = x >= 1 ? 1 : x * x * (3 - 2 * x);
+      const tgt = qs[k].clone();
+      if (tgt.dot(rotTrack[k]) < 0) tgt.set(-tgt.x, -tgt.y, -tgt.z, -tgt.w);
+      rotTrack[k] = rotTrack[k].clone().slerp(tgt, w);
+    }
+  }
+  // Filtering rounds corners off, which can pull the camera off a point. Measure how far off it is at each point's time and
+  // blend that error back in with a smooth curve, so the camera still passes exactly through every point.
+  const idx = pathData.waypoints.map((_, i) => clamp(wpT[i], 0, 1) * (M - 1));
+  const err = idx.map((s, i) => {
+    const a = Math.min(Math.floor(s), M - 2), f = s - a;
+    return new THREE.Vector3(...pathData.waypoints[i].p).sub(posTrack[a].clone().lerp(posTrack[a + 1], f));
+  });
+  const tang = err.map((e, i) => {
+    const a = Math.max(i - 1, 0), b = Math.min(i + 1, n - 1);
+    const dt = Math.max(idx[b] - idx[a], 1e-6);
+    return err[b].clone().sub(err[a]).divideScalar(dt);
+  });
+  let seg = 0;
+  for (let k = 0; k < M; k++) {
+    while (seg < n - 2 && k > idx[seg + 1]) seg++;
+    const h = Math.max(idx[seg + 1] - idx[seg], 1e-6);
+    const t = clamp((k - idx[seg]) / h, 0, 1), t2 = t * t, t3 = t2 * t;
+    const c = err[seg].clone().multiplyScalar(2 * t3 - 3 * t2 + 1)
+      .addScaledVector(tang[seg], (t3 - 2 * t2 + t) * h)
+      .addScaledVector(err[seg + 1], -2 * t3 + 3 * t2)
+      .addScaledVector(tang[seg + 1], (t3 - t2) * h);
+    posTrack[k].add(c);
+  }
+  // Same idea for the view direction: measure how far the smoothed look is from each point's own look at its time, and blend
+  // that difference back in smoothly, so the view at every point matches what the editor shows.
+  const rerr = pathData.waypoints.map((w, i) => {
+    const s = idx[i], a = Math.min(Math.floor(s), M - 2), f = s - a;
+    const cur = rotTrack[a].clone();
+    const nx = rotTrack[a + 1].clone();
+    if (nx.dot(cur) < 0) nx.set(-nx.x, -nx.y, -nx.z, -nx.w);
+    cur.slerp(nx, f);
+    const tgt = new THREE.Quaternion(...w.q);
+    const d = tgt.multiply(cur.invert()); // tgt * cur^-1
+    if (d.w < 0) d.set(-d.x, -d.y, -d.z, -d.w);
+    const ang = 2 * Math.acos(clamp(d.w, -1, 1)), sn = Math.sqrt(Math.max(1 - d.w * d.w, 0));
+    return sn < 1e-6 ? new THREE.Vector3() : new THREE.Vector3(d.x, d.y, d.z).multiplyScalar(ang / sn);
+  });
+  // Apply each point's correction only near that point (a smooth bump that never reaches the next point), so fixing the
+  // view at a point cannot drag the stretch between two points off its own view.
+  const cq = new THREE.Quaternion(), axis = new THREE.Vector3(), cv = new THREE.Vector3();
+  const reach = idx.map((s, i) => {
+    const prev = i > 0 ? s - idx[i - 1] : Infinity, next = i < n - 1 ? idx[i + 1] - s : Infinity;
+    return Math.max(1, Math.min(ROT_HZ * 2.5, prev / 2, next / 2, 1e9));
+  });
+  for (let k = 0; k < M; k++) {
+    cv.set(0, 0, 0);
+    for (let i = 0; i < n; i++) {
+      const x = Math.abs(k - idx[i]) / reach[i];
+      if (x >= 1) continue;
+      cv.addScaledVector(rerr[i], 1 - x * x * (3 - 2 * x));
+    }
+    const ang = cv.length();
+    if (ang > 1e-9) { axis.copy(cv).divideScalar(ang); cq.setFromAxisAngle(axis, ang); rotTrack[k] = cq.clone().multiply(rotTrack[k]); }
+  }
+  // The camera only ever turns left/right and up/down. Blending big turns can leave a little sideways tilt (roll) in the
+  // in-between frames, so rebuild every frame from its heading and pitch with the horizon kept level.
+  const fwd = new THREE.Vector3(), eu = new THREE.Euler(0, 0, 0, "YXZ");
+  for (let k = 0; k < M; k++) {
+    fwd.set(0, 0, -1).applyQuaternion(rotTrack[k]);
+    if (Math.abs(fwd.y) > 0.998) continue; // looking straight up or down: heading is undefined, leave as is
+    eu.set(Math.asin(clamp(fwd.y, -1, 1)), Math.atan2(-fwd.x, -fwd.z), 0, "YXZ");
+    const lv = new THREE.Quaternion().setFromEuler(eu);
+    if (lv.dot(rotTrack[k]) < 0) lv.set(-lv.x, -lv.y, -lv.z, -lv.w);
+    rotTrack[k] = lv;
+  }
+}
+// pose at timeline position tau (0..1)
+function samplePathT(tau, outPos, outQuat) {
+  if (!rotTrack) {
+    curve.getPointAt(clamp(tlToU(tau), 0, 1), outPos);
+    return;
+  }
+  const s = clamp(tau, 0, 1) * (rotM - 1);
+  const i = Math.min(Math.floor(s), rotM - 2), f = s - i;
+  outPos.copy(posTrack[i]).lerp(posTrack[i + 1], f);
+  outQuat.copy(rotTrack[i]);
+  if (rotTrack[i + 1].dot(outQuat) < 0) outQuat.set(-outQuat.x, -outQuat.y, -outQuat.z, -outQuat.w);
+  outQuat.slerp(rotTrack[i + 1], f);
+}
 function samplePath(u, outPos, outQuat) {
   const wps = pathData.waypoints;
   u = clamp(u, 0, 1);
@@ -762,10 +1003,9 @@ function samplePath(u, outPos, outQuat) {
   while (j < wps.length - 2 && u > wpU[j + 1]) j++;
   const span = Math.max(wpU[j + 1] - wpU[j], 1e-6);
   const l = clamp((u - wpU[j]) / span, 0, 1);
-  const e = l * l * (3 - 2 * l);
-  _q0.set(...wps[j].q);
-  _q1.set(...wps[j + 1].q);
-  outQuat.copy(_q0).slerp(_q1, e);
+  _qa.copy(rotQ[j]).slerp(rotQ[j + 1], l);
+  _qb.copy(rotS[j]).slerp(rotS[j + 1], l);
+  outQuat.copy(_qa).slerp(_qb, 2 * l * (1 - l));
 }
 
 /* ------------------------------------------------------------------ *
@@ -784,7 +1024,9 @@ const _tq = new THREE.Quaternion();
 function setMode(m) {
   if (m === "tour" && !curve) return;
   if (mode === "free" && m === "tour") {
-    tourU = tourTarget = 0;
+    // keep the playhead where it was, so going back to the tour resumes instead of restarting; with a point selected it starts at that point
+    if (AUTHOR && selected >= 0 && wpT[selected] != null) snapTour(wpT[selected]); // start right at the selected point
+    else tourU = tourTarget;
     lookYaw = lookPitch = 0;
   }
   if (mode === "tour" && m === "free") {
@@ -853,10 +1095,10 @@ function selectPoint(i, msg) {
 
 canvas.addEventListener("pointerdown", (e) => {
   drag = { type: e.pointerType, x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY, moved: false, point: -1, look: -1, tan: null };
-  if (AUTHOR && !editing && mode === "free" && e.button === 0 && pickWaypoint(e) >= 0) {
+  if (AUTHOR && !preview && !editing && mode === "free" && e.button === 0 && pickWaypoint(e) >= 0) {
     hudFlash("Turn on ✎ Edit path (top right, or press M) to move points");
   }
-  if (AUTHOR && editing && mode === "free" && e.button === 0) {
+  if (AUTHOR && !preview && editing && mode === "free" && e.button === 0) {
     const th = pickTangent(e);
     if (th) {
       drag.tan = th;
@@ -897,7 +1139,7 @@ canvas.addEventListener("pointerdown", (e) => {
   document.body.classList.add("dragging");
 });
 canvas.addEventListener("pointermove", (e) => {
-  if (AUTHOR && editing && !drag && mode === "free") canvas.style.cursor = pickTangent(e) || pickLook(e) >= 0 || pickWaypoint(e) >= 0 ? "grab" : "crosshair";
+  if (AUTHOR && !preview && editing && !drag && mode === "free") canvas.style.cursor = pickTangent(e) || pickLook(e) >= 0 || pickWaypoint(e) >= 0 ? "grab" : "crosshair";
   if (!drag) return;
   if (Math.hypot(e.clientX - drag.sx, e.clientY - drag.sy) > 4) drag.moved = true;
   if (drag.tan) {
@@ -961,20 +1203,21 @@ canvas.addEventListener("pointermove", (e) => {
     pitch = clamp(pitch - dy * 0.003, -1.5, 1.5);
     setCameraFromYawPitch();
   } else {
-    lookYaw = clamp(lookYaw - dx * 0.003, -1.3, 1.3);
+    lookYaw = wrapPi(lookYaw - dx * 0.003); // no limit: look all the way around (360°)
     if (drag.type === "touch") {
       tourTarget = clamp(tourTarget - dy * 0.0018, 0, 1);
       playing = false;
     } else {
-      lookPitch = clamp(lookPitch - dy * 0.003, -0.8, 0.8);
+      lookPitch = clamp(lookPitch - dy * 0.003, -1.45, 1.45);
     }
   }
 });
+const wrapPi = (a) => a - Math.PI * 2 * Math.floor((a + Math.PI) / (Math.PI * 2)); // keep an angle in -180°..180° so easing back takes the short way round
 const endDrag = () => {
   if (drag) {
     if ((drag.point >= 0 || drag.look >= 0 || drag.tan) && drag.moved) save();
     // plain click on empty space = deselect
-    else if (AUTHOR && drag.point < 0 && drag.look < 0 && !drag.tan && !drag.moved && selected >= 0) selectPoint(-1);
+    else if (AUTHOR && !preview && drag.point < 0 && drag.look < 0 && !drag.tan && !drag.moved && selected >= 0) selectPoint(-1);
   }
   drag = null;
   document.body.classList.remove("dragging");
@@ -984,7 +1227,7 @@ canvas.addEventListener("pointercancel", endDrag);
 
 // double-click on the path line = add a point right there
 canvas.addEventListener("dblclick", (e) => {
-  if (!AUTHOR || !editing || mode !== "free") return;
+  if (!AUTHOR || preview || !editing || mode !== "free") return;
   const th = pickTangent(e);
   if (th) {
     delete pathData.waypoints[th.i].h;
@@ -1036,11 +1279,11 @@ canvas.addEventListener(
 window.addEventListener("keydown", (e) => {
   if (e.target instanceof HTMLInputElement) return;
   const k = e.key.toLowerCase();
-  if (AUTHOR && (e.ctrlKey || e.metaKey) && (k === "c" || k === "x" || k === "v")) {
+  if (AUTHOR && !preview && (e.ctrlKey || e.metaKey) && (k === "c" || k === "x" || k === "v")) {
     e.preventDefault();
     return clipboardOp(k, e.shiftKey);
   }
-  if (AUTHOR && (e.ctrlKey || e.metaKey) && (k === "z" || k === "y")) {
+  if (AUTHOR && !preview && (e.ctrlKey || e.metaKey) && (k === "z" || k === "y")) {
     e.preventDefault();
     return stepHistory(k === "y" || e.shiftKey ? 1 : -1);
   }
@@ -1048,7 +1291,8 @@ window.addEventListener("keydown", (e) => {
   if (mode === "free") {
     if (["w", "a", "s", "d", "q", "e", "shift"].includes(k)) keys.add(k);
   }
-  if (AUTHOR) {
+  if (AUTHOR && preview && k === "escape") return setPreview(false);
+  if (AUTHOR && !preview) {
     // Space while the pointer is over the playbar = play / pause (instead of dropping a point)
     if (k === " " && overBar && curve) {
       e.preventDefault();
@@ -1058,6 +1302,7 @@ window.addEventListener("keydown", (e) => {
     }
     if (k === " " && mode === "free") {
       e.preventDefault();
+      if (!editing) return hudFlash("Turn on Edit (M) to add points");
       addWaypoint();
       return;
     }
@@ -1101,6 +1346,22 @@ window.addEventListener("keydown", (e) => {
       return hudFlash("Ground lock " + (GROUND.on ? "on" : "off"));
     }
     if (k === "t") return setMode(mode === "tour" ? "free" : "tour");
+    if (k === "p" && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
+      // P drops a point, same as Space (only while flying; in preview mode there is nothing to add to)
+      e.preventDefault();
+      if (!editing) return hudFlash("Turn on Edit (M) to add points");
+      if (mode === "tour") {
+        // Works straight from the tour view: captures the camera as it is right now (including any look-around
+        // from dragging) at the playhead, pauses, and clears the look offset since it is baked into the point.
+        playing = false;
+        $("playBtn").textContent = "▶";
+        addWaypoint();
+        lookYaw = lookPitch = 0;
+        return;
+      }
+      addWaypoint();
+      return;
+    }
     if (k === "p") {
       if (!curve) return;
       setMode("tour");
@@ -1196,12 +1457,29 @@ function addWaypoint() {
     p: camera.position.toArray().map((v) => +v.toFixed(5)),
     q: camera.quaternion.toArray().map((v) => +v.toFixed(6)),
   };
-  if (selected >= 0) {
+  // If the playhead sits between two points, the new point goes between them (and takes that time on the timeline);
+  // otherwise it goes after the selected point, or at the end.
+  const wps = pathData.waypoints, EPS = 0.002;
+  let between = -1;
+  if (curve && wpT.length >= 2) {
+    for (let j = 0; j < wpT.length - 1; j++) {
+      if (tourTarget > wpT[j] + EPS && tourTarget < wpT[j + 1] - EPS) {
+        between = j;
+        break;
+      }
+    }
+  }
+  if (between >= 0) {
+    wp.t = +tourTarget.toFixed(4);
+    wps.splice(between + 1, 0, wp);
+    selected = between + 1;
+    hudFlash("Added as point " + (between + 2) + " · between " + (between + 1) + " and " + (between + 3));
+  } else if (selected >= 0) {
     // a point is selected: slot the new one in right after it
-    pathData.waypoints.splice(selected + 1, 0, wp);
+    wps.splice(selected + 1, 0, wp);
     selected += 1;
   } else {
-    pathData.waypoints.push(wp);
+    wps.push(wp);
   }
   save();
   rebuildPath();
@@ -1291,7 +1569,7 @@ function updateHud() {
   const n = pathData.waypoints.length;
   document.body.classList.toggle("has-path", !!curve);
   if (!AUTHOR) return;
-  $("author").hidden = false;
+  $("author").hidden = preview;
   $("count").textContent = n + (n === 1 ? " point" : " points");
   $("modeLabel").textContent = mode === "tour" ? "previewing" : "free fly";
 }
@@ -1300,6 +1578,7 @@ function updateHud() {
  *  Frame loop
  * ------------------------------------------------------------------ */
 let last = performance.now();
+let lastLook = 0;
 function frame(now) {
   const dt = Math.min((now - last) / 1000, 0.1);
   last = now;
@@ -1334,10 +1613,12 @@ function frame(now) {
       }
     }
     tourU += (tourTarget - tourU) * (1 - Math.exp(-dt * 4));
-    samplePath(tlToU(tourU), _p, _pq);
+    samplePathT(tourU, _p, _pq);
     camera.position.copy(_p);
-    if (!drag) {
-      const k = Math.exp(-dt * 1.4);
+    if (drag) lastLook = now;
+    else if (now - lastLook > 3500) {
+      // hold wherever the visitor looked; drift back to the path's own heading only after a few idle seconds
+      const k = Math.exp(-dt * 0.9);
       lookYaw *= k;
       lookPitch *= k;
     }
@@ -1350,8 +1631,8 @@ function frame(now) {
 
   if (AUTHOR) {
     // hide the route decorations while previewing so they do not clutter the shot
-    markers.visible = mode !== "tour";
-    if (pathLine) pathLine.visible = mode !== "tour";
+    markers.visible = mode !== "tour" && !preview;
+    if (pathLine) pathLine.visible = mode !== "tour" && !preview;
     // keep number labels a steady size on screen, near or far
     for (const m of markers.children) {
       if (!m.isSprite) continue;
@@ -1363,7 +1644,7 @@ function frame(now) {
 
   renderer.clear();
   renderer.render(scene, camera);
-  if (AUTHOR) {
+  if (AUTHOR && !preview) {
     renderer.clearDepth();
     renderer.render(overlay, camera);
   }
@@ -1383,6 +1664,16 @@ $("loader").classList.add("done");
 if (AUTHOR) {
   hudFlash(pathData.waypoints.length ? "Loaded your saved path" : "Fly to a spot, press Space to drop a point");
 }
+if (!AUTHOR) {
+  const pb = $("ptsBtn");
+  pb.textContent = "☰ Chapters";
+  pb.title = "Jump to a place";
+  pb.addEventListener("click", () => {
+    $("pts").hidden = !$("pts").hidden;
+    pb.classList.toggle("on", !$("pts").hidden);
+  });
+  renderChapters();
+}
 if (AUTHOR) {
   document.body.classList.add("author");
   const pb = $("ptsBtn");
@@ -1399,4 +1690,83 @@ if (AUTHOR) {
   eb.hidden = false;
   eb.addEventListener("click", () => setEditing(!editing));
 }
-window.__tour = { overlay, markers, diagv: () => diag, scene, renderer, camera, mesh, pathData, setMode, get mode() { return mode; }, setEditing };
+// Auto-pace: spread the points over a total time so the camera never moves or turns faster than a comfortable rate.
+// Each stretch gets time for the distance it covers PLUS time for how far the view has to turn.
+const PACE_SPEED = 1.1; // metres per second of travel
+const PACE_TURN = 18; // degrees per second of turning
+function autoPace(total) {
+  const wps = pathData.waypoints, n = wps.length;
+  if (!curve || n < 3) return hudFlash("Need at least 3 points to pace");
+  const len = curve.getLength();
+  const raw = [];
+  let maxRate = 0;
+  for (let i = 0; i < n - 1; i++) {
+    const L = (wpU[i + 1] - wpU[i]) * len;
+    const ang = (2 * Math.acos(Math.min(1, Math.abs(rotQ[i].dot(rotQ[i + 1])))) * 180) / Math.PI;
+    const t0 = curve.getTangentAt(wpU[i]), t1 = curve.getTangentAt(Math.min(wpU[i + 1], 0.9999));
+    const head = (Math.acos(clamp(t0.dot(t1), -1, 1)) * 180) / Math.PI; // how much the direction of travel bends
+    raw.push(Math.max(L / PACE_SPEED + ang / PACE_TURN + head / (PACE_TURN * 2), 1.2));
+  }
+  const sum = raw.reduce((a, b) => a + b, 0), k = total / sum;
+  let acc = 0;
+  for (let i = 0; i < n - 1; i++) {
+    const T = raw[i] * k;
+    const ang = (2 * Math.acos(Math.min(1, Math.abs(rotQ[i].dot(rotQ[i + 1])))) * 180) / Math.PI;
+    maxRate = Math.max(maxRate, ang / T);
+    acc += T;
+    if (i + 1 < n - 1) wps[i + 1].t = +(acc / total).toFixed(4);
+  }
+  pathData.duration = +total.toFixed(1);
+  save();
+  rebuildPath();
+  hudFlash("Paced to " + fmtT(total) + " · fastest turn " + Math.round(maxRate) + "°/s");
+}
+if (AUTHOR) {
+  $("paceBtn").hidden = false;
+  $("paceBtn").addEventListener("click", () => {
+    const v = window.prompt("Total length in seconds (130 = 2:10):", String(Math.round(pathData.duration < 120 ? 130 : pathData.duration)));
+    const s = Number(v);
+    if (v && s >= 20 && s <= 1200) autoPace(s);
+  });
+}
+
+// "Preview as visitor": hide every author tool and show exactly what a visitor gets (tour mode, chapters menu, plain timeline)
+function setPreview(on) {
+  if (!AUTHOR || preview === on) return;
+  if (on && editing) setEditing(false);
+  preview = on;
+  const pb = $("ptsBtn");
+  document.body.classList.toggle("author", !on);
+  document.body.classList.toggle("previewing", on);
+  $("prevBtn").textContent = on ? "✕ Exit preview" : "👁 Preview";
+  $("prevBtn").classList.toggle("on", on);
+  $("editBtn").hidden = on;
+  $("author").hidden = on;
+  pb.textContent = on ? "☰ Chapters" : "☰ Points";
+  pb.classList.remove("on");
+  if (on) {
+    $("pts").hidden = true;
+    selectPoint(-1);
+    if (curve) {
+      if (mode !== "tour") setMode("tour");
+      tourU = tourTarget = 0;
+      playing = false;
+      $("playBtn").textContent = "▶";
+    }
+    renderChapters();
+    hudFlash("Preview · this is what visitors see · Esc to exit");
+  } else {
+    pb.hidden = false;
+    $("pts").hidden = false;
+    pb.classList.add("on");
+    if (mode === "tour") setMode("free");
+    rebuildPath();
+    hudFlash("Back to editing");
+  }
+  updateHud();
+}
+if (AUTHOR) {
+  $("prevBtn").hidden = false;
+  $("prevBtn").addEventListener("click", () => setPreview(!preview));
+}
+window.__tour = { samplePathT, autoPace, setPreview, rebuildPath, overlay, markers, diagv: () => diag, scene, renderer, camera, mesh, pathData, setMode, get mode() { return mode; }, setEditing };
