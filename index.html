@@ -21,9 +21,41 @@
   #bar { height:100%; width:0; background:var(--fg); transition:width .2s; }
   #pct { color:var(--dim); font-variant-numeric:tabular-nums; letter-spacing:.08em; }
 
-  #ui { position:fixed; left:50%; bottom:calc(20px + env(safe-area-inset-bottom)); transform:translateX(-50%);
-    display:flex; align-items:center; gap:12px; padding:10px 14px; border-radius:999px;
-    background:#141416cc; backdrop-filter:blur(14px); border:1px solid #ffffff1a; width:min(560px, calc(100vw - 24px)); }
+  #ui { position:fixed; left:0; right:0; bottom:0; padding:10px 20px calc(12px + env(safe-area-inset-bottom));
+    display:flex; align-items:flex-end; gap:14px;
+    background:#141416d9; backdrop-filter:blur(14px); border-top:1px solid #ffffff1a; }
+  #track { position:relative; flex:1; min-width:60px; height:34px; }
+  body.author #track { height:58px; }
+  #track #slider { position:absolute; left:0; right:0; bottom:4px; width:100%; margin:0; }
+  #marks { position:absolute; left:0; right:0; top:0; height:40px; pointer-events:none; display:none; }
+  body.author #marks { display:block; }
+  .mk { position:absolute; transform:translateX(-50%); pointer-events:auto; cursor:pointer; text-align:center; font-size:10px; color:var(--dim);
+    font-variant-numeric:tabular-nums; line-height:1; user-select:none; }
+  .mk i { display:block; font-style:normal; width:20px; height:20px; line-height:20px; margin:0 auto 3px; border-radius:50%;
+    background:#ffb84d; color:#111; font-weight:700; font-size:11px; }
+  .mk.first i { background:#5ee08a; } .mk.last i { background:#ff6b9a; } .mk.sel i { background:#5aa9ff; box-shadow:0 0 0 3px #5aa9ff55; }
+  .mk:hover i { transform:scale(1.15); }
+  #clock { color:var(--dim); font-variant-numeric:tabular-nums; font-size:12px; letter-spacing:.04em; padding-bottom:7px; white-space:nowrap; display:none; }
+  body.author #clock { display:block; }
+  #playBtn, #modeBtn, #clock { margin-bottom:0; }
+  #playBtn, #modeBtn { align-self:flex-end; margin-bottom:2px; }
+  #ptsBtn { position:fixed; right:20px; top:136px; background:#141416cc; backdrop-filter:blur(14px); }
+  #pts { position:fixed; right:20px; top:176px; width:230px; max-height:calc(100vh - 176px - 110px); overflow:auto; padding:8px; border-radius:12px;
+    background:#141416e6; backdrop-filter:blur(14px); border:1px solid #ffffff1a; font-size:13px; }
+  #pts[hidden] { display:none; }
+  #pts .empty { color:var(--dim); padding:8px; }
+  #pts .pt { display:flex; align-items:center; gap:10px; padding:6px 8px; border-radius:8px; cursor:pointer; }
+  #pts .pt:hover { background:#ffffff14; }
+  #pts .pt.sel { background:#5aa9ff33; }
+  #pts .pt b { width:22px; height:22px; line-height:22px; text-align:center; border-radius:50%; background:#ffb84d; color:#111; font-size:12px; flex:none; }
+  #pts .pt.first b { background:#5ee08a; } #pts .pt.last b { background:#ff6b9a; }
+  #pts .pt .nm { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; color:var(--fg); }
+  #pts .pt .nm.dflt { color:var(--dim); }
+  #pts .nmIn { flex:1; min-width:0; font:inherit; color:var(--fg); background:#0008; border:1px solid #ffffff40; border-radius:6px; padding:2px 6px; outline:none; }
+  #pts .nmIn:focus { border-color:#5aa9ff; }
+  #pts .ren { padding:0 6px; font-size:12px; opacity:0; border:none; background:none; }
+  #pts .pt:hover .ren, #pts .pt.sel .ren { opacity:.7; } #pts .ren:hover { opacity:1; }
+  #pts .pt span { flex:1; color:var(--dim); } #pts .pt em { font-style:normal; font-variant-numeric:tabular-nums; }
   body:not(.has-path) #ui { display:none; }
   button { font:inherit; color:var(--fg); background:#ffffff14; border:1px solid #ffffff1f; border-radius:999px;
     padding:6px 14px; cursor:pointer; white-space:nowrap; }
@@ -32,14 +64,18 @@
   #slider { flex:1; accent-color:var(--fg); min-width:60px; }
 
   #resetBtn { position:fixed; right:20px; top:56px; background:#141416cc; backdrop-filter:blur(14px); }
+  #editBtn { position:fixed; right:20px; top:96px; background:#141416cc; backdrop-filter:blur(14px); }
+  #ptsBtn.on, #editBtn.on { background:var(--accent); color:#111; }
+  body.editing canvas { cursor:crosshair; }
   #hint { position:fixed; right:20px; top:18px; color:var(--dim); font-size:12px; text-align:right; pointer-events:none; text-shadow:0 1px 10px #000a; }
   body[data-mode="free"] .tour-hint, body[data-mode="tour"] .free-hint { display:none; }
 
   #author { position:fixed; left:20px; top:52px; padding:12px 14px; border-radius:12px; background:#141416d9;
-    border:1px solid #ffffff1a; backdrop-filter:blur(14px); font-size:12px; max-width:290px; }
+    border:1px solid #ffffff1a; backdrop-filter:blur(14px); font-size:12px; max-width:330px; }
   #author b { color:var(--accent); font-weight:600; }
   #author kbd { background:#ffffff1c; border-radius:4px; padding:1px 6px; font:inherit; font-family:ui-monospace,Consolas,monospace; }
   #author .row { display:flex; justify-content:space-between; gap:16px; margin-top:4px; color:var(--dim); }
+  #author .sep { height:1px; background:#ffffff1a; margin:8px 0 2px; }
   #author .head { display:flex; justify-content:space-between; gap:14px; margin-bottom:6px; }
 
   #flash { position:fixed; left:50%; top:20px; transform:translate(-50%,-8px); background:#141416ee; padding:8px 16px;
@@ -49,6 +85,9 @@
 </head>
 <body data-mode="free">
   <div id="title"></div>
+  <button id="ptsBtn" hidden title="List of points (L)">☰ Points</button>
+  <div id="pts" hidden></div>
+  <button id="editBtn" hidden title="Edit the path (M)">✎ Edit path</button>
   <button id="resetBtn" title="Back to the start (R)">↺ Reset</button>
   <div id="hint">
     <span class="tour-hint">Scroll or swipe to move · drag to look around</span>
@@ -57,16 +96,24 @@
 
   <div id="ui">
     <button id="playBtn" title="Play / pause">▶</button>
-    <input id="slider" type="range" min="0" max="1000" value="0" aria-label="Position along the tour">
+    <div id="track"><div id="marks"></div><input id="slider" type="range" min="0" max="1000" value="0" aria-label="Position along the tour"></div>
+    <span id="clock"></span>
     <button id="modeBtn">Explore freely</button>
   </div>
 
   <div id="author" hidden>
     <div class="head"><b>Author mode</b><span><span id="count">0 points</span> · <span id="modeLabel">free fly</span></span></div>
-    <div class="row"><span><kbd>Space</kbd> drop a point</span><span><kbd>⌫</kbd> undo · <kbd>⇧⌫</kbd> clear</span></div>
+    <div class="row"><span><kbd>Space</kbd> drop a point <small style="opacity:.6">(over the playbar: play / pause)</small></span><span><kbd>⌫</kbd> undo · <kbd>⇧⌫</kbd> clear</span></div>
     <div class="row"><span><kbd>P</kbd> preview</span><span><kbd>T</kbd> fly / preview</span></div>
     <div class="row"><span><kbd>O</kbd> fix orientation</span><span><kbd>X</kbd> save path.json</span></div>
     <div class="row"><span><kbd>R</kbd> reset to start</span><span><kbd>G</kbd> ground lock</span></div>
+    <div class="sep"></div>
+    <div class="row"><span>Edit path (<kbd>M</kbd>): drag a point to move it</span><span><kbd>⇧</kbd> keeps height</span></div>
+    <div class="row"><span>Double-click the line</span><span>adds a point</span></div>
+    <div class="row"><span>Purple ◆ on a selected point</span><span>drag to bend the path</span></div>
+    <div class="row"><span><kbd>[</kbd> <kbd>]</kbd> step through points</span><span><kbd>V</kbd> view from it</span></div>
+    <div class="row"><span><kbd>Ctrl</kbd>+<kbd>C</kbd> <kbd>X</kbd> <kbd>V</kbd> copy / cut / paste</span><span>pastes at the camera</span></div>
+    <div class="row"><span><kbd>U</kbd> set it to this view</span><span><kbd>Esc</kbd> deselect</span></div>
   </div>
 
   <div id="flash"></div>

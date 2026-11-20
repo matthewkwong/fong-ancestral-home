@@ -8,7 +8,7 @@ const params = new URLSearchParams(location.search);
 const AUTHOR = params.has("author");
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
-const STORE_KEY = "china26-path-v1";
+const STORE_KEY = "china26-path-v2";
 
 async function fetchJSON(url, fallback) {
   try {
@@ -55,12 +55,45 @@ pathData.waypoints ??= [];
 pathData.duration ??= cfg.duration ?? 90;
 pathData.orientation ??= cfg.orientation ?? 3;
 
-function save() {
-  if (!AUTHOR) return;
+// undo / redo history (author mode): snapshots of the path after every change
+const hist = { stack: [], i: -1 };
+const snap = () => JSON.stringify({ o: pathData.orientation, w: pathData.waypoints, d: pathData.duration });
+function record() {
+  const s = snap();
+  if (hist.stack[hist.i] === s) return;
+  hist.stack.length = hist.i + 1;
+  hist.stack.push(s);
+  if (hist.stack.length > 200) hist.stack.shift();
+  hist.i = hist.stack.length - 1;
+}
+function persist() {
   try {
     localStorage.setItem(STORE_KEY, JSON.stringify(pathData));
   } catch {}
 }
+function save() {
+  if (!AUTHOR) return;
+  record();
+  persist();
+}
+function stepHistory(dir) {
+  const j = hist.i + dir;
+  if (j < 0 || j >= hist.stack.length) return hudFlash(dir < 0 ? "Nothing to undo" : "Nothing to redo");
+  hist.i = j;
+  const st = JSON.parse(hist.stack[j]);
+  const orientChanged = st.o !== pathData.orientation;
+  pathData.orientation = st.o;
+  pathData.waypoints = st.w;
+  if (st.d) pathData.duration = st.d;
+  if (orientChanged) mesh.quaternion.copy(ORIENTATIONS[st.o]);
+  selected = Math.min(selected, st.w.length - 1);
+  persist();
+  rebuildPath();
+  if (orientChanged) buildFloor();
+  if (!curve && mode === "tour") setMode("free");
+  hudFlash((dir < 0 ? "Undo" : "Redo") + " · " + st.w.length + " point" + (st.w.length === 1 ? "" : "s"));
+}
+if (AUTHOR) record();
 
 /* ------------------------------------------------------------------ *
  *  Three + Spark
@@ -70,6 +103,7 @@ renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 document.body.prepend(renderer.domElement);
 const canvas = renderer.domElement;
+renderer.autoClear = false;
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 1000);
@@ -237,7 +271,7 @@ let yaw = 0,
   pitch = 0;
 const euler = new THREE.Euler(0, 0, 0, "YXZ");
 let speedMul = 1;
-const baseSpeed = () => diag / 40; // units per second
+const baseSpeed = () => diag / 26; // units per second (default free-fly speed; scroll adjusts it)
 const keys = new Set();
 const vel = new THREE.Vector3();
 
@@ -255,27 +289,364 @@ function syncYawPitchFromCamera() {
  *  Path sampling
  * ------------------------------------------------------------------ */
 let curve = null;
-let wpU = []; // arc-length parameter of each waypoint
+let wpU = []; // arc-length parameter of each waypoint (where it sits on the route)
+let wpT = []; // timeline position of each waypoint, 0..1 (auto = wpU, or a custom w.t you dragged)
+// timeline position -> position along the route (piecewise between waypoints, so each point lands on its own time)
+function tlToU(x) {
+  const n = wpT.length;
+  if (n < 2) return x;
+  x = clamp(x, 0, 1);
+  let j = 0;
+  while (j < n - 2 && x > wpT[j + 1]) j++;
+  const f = clamp((x - wpT[j]) / Math.max(wpT[j + 1] - wpT[j], 1e-6), 0, 1);
+  return wpU[j] + f * (wpU[j + 1] - wpU[j]);
+}
+const T_GAP = 0.004;
 let pathLine = null;
+const overlay = new THREE.Scene(); // drawn after the splats, always on top
 const markers = new THREE.Group();
-scene.add(markers);
+overlay.add(markers);
+
+let editing = false; // author: point-editing mode (drag points, add on line)
+function setEditing(on) {
+  editing = !!on;
+  const b = $("editBtn");
+  if (b) {
+    b.textContent = editing ? "✓ Done editing" : "✎ Edit path";
+    b.classList.toggle("on", editing);
+  }
+  document.body.classList.toggle("editing", editing);
+  if (!editing) selectPoint(-1);
+  hudFlash(editing ? "Edit mode · drag points to move them · double-click the line to add one" : "Edit mode off");
+}
+let selected = -1; // index of the selected waypoint (author mode)
+
+function disposeGroup(g) {
+  while (g.children.length) {
+    const m = g.children.pop();
+    m.traverse((o) => {
+      o.geometry?.dispose();
+      o.material?.map?.dispose();
+      o.material?.dispose();
+    });
+  }
+}
+
+function makeLabel(text, color) {
+  const c = document.createElement("canvas");
+  c.width = c.height = 96;
+  const x = c.getContext("2d");
+  x.font = "700 60px system-ui, sans-serif";
+  x.textAlign = "center";
+  x.textBaseline = "middle";
+  x.lineWidth = 10;
+  x.strokeStyle = "rgba(0,0,0,.85)";
+  x.strokeText(text, 48, 52);
+  x.fillStyle = color;
+  x.fillText(text, 48, 52);
+  const mat = new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(c), depthTest: false, transparent: true });
+  const sp = new THREE.Sprite(mat);
+  sp.renderOrder = 1003;
+  return sp;
+}
+
+// the "look" handle at the end of a point's direction line: drag it to aim the camera at that point
+function makeHandle(sel) {
+  const S = 96, c = document.createElement("canvas");
+  c.width = c.height = S;
+  const x = c.getContext("2d");
+  x.beginPath();
+  x.arc(S / 2, S / 2, S / 2 - 8, 0, Math.PI * 2);
+  x.fillStyle = sel ? "rgba(92,200,255,.9)" : "rgba(255,255,255,.85)";
+  x.fill();
+  x.lineWidth = 8;
+  x.strokeStyle = "#111";
+  x.stroke();
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true }));
+}
+const LOOK_LEN = () => diag * 0.06;
+const _lq = new THREE.Quaternion(), _lf = new THREE.Vector3(), _lt = new THREE.Vector3();
+function lookTip(i, out) {
+  const w = pathData.waypoints[i];
+  _lf.set(0, 0, -1).applyQuaternion(_lq.set(...w.q));
+  return out.set(...w.p).addScaledVector(_lf, LOOK_LEN());
+}
+// nearest look handle within ~18px of the pointer
+function pickLook(e) {
+  let best = -1, bestD = 18;
+  pathData.waypoints.forEach((w, i) => {
+    const sp = toScreen(lookTip(i, _lt));
+    if (!sp) return;
+    const d = Math.hypot(sp[0] - e.clientX, sp[1] - e.clientY);
+    if (d < bestD) { bestD = d; best = i; }
+  });
+  return best;
+}
+
+function makeBall(num, colorHex, sel) {
+  const S = 128, c = document.createElement("canvas");
+  c.width = c.height = S;
+  const x = c.getContext("2d");
+  const hex = "#" + new THREE.Color(colorHex).getHexString();
+  x.beginPath();
+  x.arc(S / 2, S / 2, S / 2 - 6, 0, Math.PI * 2);
+  x.fillStyle = "#111";
+  x.fill();
+  const g = x.createRadialGradient(S * 0.38, S * 0.35, S * 0.05, S / 2, S / 2, S / 2 - 10);
+  g.addColorStop(0, "#ffffff");
+  g.addColorStop(0.25, hex);
+  g.addColorStop(1, hex);
+  x.beginPath();
+  x.arc(S / 2, S / 2, S / 2 - 12, 0, Math.PI * 2);
+  x.fillStyle = g;
+  x.fill();
+  if (sel) {
+    x.lineWidth = 6;
+    x.strokeStyle = "#fff";
+    x.stroke();
+  }
+  x.font = "800 " + (num > 9 ? 52 : 64) + "px system-ui, sans-serif";
+  x.textAlign = "center";
+  x.textBaseline = "middle";
+  x.fillStyle = "#111";
+  x.fillText(String(num), S / 2, S / 2 + 4);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true }));
+  return sp;
+}
+
+const fmtT = (s) => Math.floor(s / 60) + ":" + String(Math.floor(s % 60)).padStart(2, "0");
+function jumpTo(i) {
+  const wps = pathData.waypoints;
+  if (!wps[i]) return;
+  selectPoint(i);
+  if (mode === "tour" && wpT[i] != null) {
+    tourTarget = wpT[i];
+    playing = false;
+    $("playBtn").textContent = "▶";
+  } else viewFrom(i);
+}
+function renderTimeline() {
+  if (!AUTHOR) return;
+  const wps = pathData.waypoints,
+    n = wps.length,
+    dur = pathData.duration;
+  const marks = $("marks");
+  marks.innerHTML = "";
+  const list = $("pts");
+  list.innerHTML = n ? "" : '<div class="empty">No points yet. Fly somewhere and press Space.</div>';
+  wps.forEach((_, i) => {
+    const u = wpT[i] ?? (n > 1 ? i / (n - 1) : 0);
+    const cls = (i === 0 ? " first" : "") + (i === n - 1 && n > 1 ? " last" : "") + (i === selected ? " sel" : "");
+    if (curve) {
+      const mk = document.createElement("div");
+      mk.className = "mk" + cls;
+      mk.style.left = "calc(8px + (100% - 16px) * " + u + ")";
+      mk.innerHTML = "<i>" + (i + 1) + "</i>" + fmtT(u * dur);
+      mk.title = "Point " + (i + 1) + (wps[i].name ? " · " + wps[i].name : "") + " · " + fmtT(u * dur);
+      const movable = i > 0; // the first point is pinned to 0:00; the last one sets the video length
+      if (movable) {
+        mk.style.cursor = "ew-resize";
+        mk.title += " · drag to retime (past the end = longer video) · double-click to reset";
+      }
+      let dragging = false, moved = false, S0 = [], S = [], newDur = dur;
+      const GAP = 0.5; // minimum seconds between points
+      mk.addEventListener("pointerdown", (e) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        dragging = true;
+        moved = false;
+        S0 = wpT.map((x) => x * dur);
+        S = S0.slice();
+        newDur = dur;
+        try { mk.setPointerCapture(e.pointerId); } catch {}
+      });
+      mk.addEventListener("pointermove", (e) => {
+        if (!dragging || !movable) return;
+        const r = $("track").getBoundingClientRect();
+        const frac = (e.clientX - r.left - 8) / Math.max(r.width - 16, 1);
+        const s = clamp(frac * dur, GAP * i, Math.max(dur * 3, 30));
+        if (Math.abs(s - S0[i]) > 0.05) moved = true;
+        S = S0.slice();
+        S[i] = s;
+        for (let j = 0; j < i; j++) S[j] = Math.min(S0[j], s - GAP * (i - j));
+        for (let j = i + 1; j < n; j++) S[j] = Math.max(S0[j], s + GAP * (j - i));
+        newDur = i === n - 1 ? s : Math.max(dur, S[n - 1]);
+        [...marks.children].forEach((el, j) => {
+          el.style.left = "calc(8px + (100% - 16px) * " + S[j] / newDur + ")";
+          el.lastChild.textContent = fmtT(S[j]);
+        });
+        $("clock").textContent = "length " + fmtT(newDur);
+      });
+      mk.addEventListener("pointerup", () => {
+        if (!dragging) return;
+        dragging = false;
+        if (moved) {
+          const d = Math.max(+newDur.toFixed(1), 2);
+          pathData.duration = d;
+          for (let j = 1; j < n - 1; j++) wps[j].t = +(S[j] / d).toFixed(4);
+          save();
+          rebuildPath();
+          hudFlash("Point " + (i + 1) + " at " + fmtT(S[i]) + " · video length " + fmtT(d));
+        } else jumpTo(i);
+      });
+      mk.addEventListener("dblclick", () => {
+        if (!movable || wps[i].t == null) return;
+        delete wps[i].t;
+        save();
+        rebuildPath();
+        hudFlash("Point " + (i + 1) + " timing reset");
+      });
+      marks.appendChild(mk);
+    }
+    const row = document.createElement("div");
+    row.className = "pt" + cls;
+    const dflt = i === 0 ? "Start" : i === n - 1 ? "End" : "Point";
+    const nm = wps[i].name;
+    row.innerHTML = "<b>" + (i + 1) + "</b><span class=\"nm" + (nm ? "" : " dflt") + "\"></span><em>" + (curve ? fmtT(u * dur) : "–") + "</em><button class=\"ren\" title=\"Rename\">✎</button>";
+    row.querySelector(".nm").textContent = nm || dflt;
+    const startRename = () => {
+      const span = row.querySelector(".nm");
+      const inp = document.createElement("input");
+      inp.type = "text";
+      inp.value = nm || "";
+      inp.placeholder = dflt;
+      inp.maxLength = 40;
+      inp.className = "nmIn";
+      span.replaceWith(inp);
+      inp.focus();
+      inp.select();
+      let done = false;
+      const finish = (commit) => {
+        if (done) return;
+        done = true;
+        if (commit) {
+          const v = inp.value.trim();
+          if (v) wps[i].name = v;
+          else delete wps[i].name;
+          save();
+        }
+        renderTimeline();
+      };
+      inp.addEventListener("keydown", (e) => {
+        e.stopPropagation();
+        if (e.key === "Enter") finish(true);
+        else if (e.key === "Escape") finish(false);
+      });
+      inp.addEventListener("blur", () => finish(true));
+      inp.addEventListener("click", (e) => e.stopPropagation());
+    };
+    row.querySelector(".ren").addEventListener("click", (e) => {
+      e.stopPropagation();
+      startRename();
+    });
+    row.querySelector(".nm").addEventListener("dblclick", (e) => {
+      e.stopPropagation();
+      startRename();
+    });
+    row.addEventListener("click", () => jumpTo(i));
+    list.appendChild(row);
+  });
+}
+
+// The route is a chain of cubic bezier segments. Each point has one smooth tangent handle H:
+// the curve leaves the point along +H and arrives along +H, so dragging it bends the path there.
+class BezierPath extends THREE.Curve {
+  constructor(pts, hs) {
+    super();
+    this.pts = pts;
+    this.hs = hs;
+  }
+  getPoint(t, target = new THREE.Vector3()) {
+    const n = this.pts.length - 1;
+    const s = clamp(t, 0, 1) * n;
+    const i = Math.min(Math.floor(s), n - 1);
+    const f = s - i, g = 1 - f;
+    const p0 = this.pts[i], p3 = this.pts[i + 1];
+    const p1 = _b1.copy(p0).add(this.hs[i]);
+    const p2 = _b2.copy(p3).sub(this.hs[i + 1]);
+    const a = g * g * g, b = 3 * g * g * f, c = 3 * g * f * f, d = f * f * f;
+    return target.set(
+      a * p0.x + b * p1.x + c * p2.x + d * p3.x,
+      a * p0.y + b * p1.y + c * p2.y + d * p3.y,
+      a * p0.z + b * p1.z + c * p2.z + d * p3.z
+    );
+  }
+}
+const _b1 = new THREE.Vector3(), _b2 = new THREE.Vector3();
+// automatic handle for point i (used until you drag it): smooth, and scaled to the nearer neighbour so it never overshoots
+function autoHandle(i, pts) {
+  const n = pts.length;
+  const prev = pts[Math.max(i - 1, 0)], next = pts[Math.min(i + 1, n - 1)];
+  const dir = next.clone().sub(prev);
+  if (dir.lengthSq() < 1e-12) return new THREE.Vector3();
+  dir.normalize();
+  const dl = i > 0 ? pts[i].distanceTo(pts[i - 1]) : Infinity;
+  const dr = i < n - 1 ? pts[i].distanceTo(pts[i + 1]) : Infinity;
+  return dir.multiplyScalar(Math.min(dl, dr) / 3);
+}
+function handleVecs(wps) {
+  const pts = wps.map((w) => new THREE.Vector3(...w.p));
+  return { pts, hs: wps.map((w, i) => (w.h ? new THREE.Vector3(...w.h) : autoHandle(i, pts))) };
+}
+// the two handle ends of a point (forward = +H, back = -H), for drawing and picking
+function tangentEnds(i, out) {
+  const wps = pathData.waypoints;
+  const { pts, hs } = handleVecs(wps);
+  const p = pts[i];
+  out.fwd = p.clone().add(hs[i]);
+  out.back = p.clone().sub(hs[i]);
+  return out;
+}
+function makeTangentHandle() {
+  const S = 96, c = document.createElement("canvas");
+  c.width = c.height = S;
+  const x = c.getContext("2d");
+  x.translate(S / 2, S / 2);
+  x.rotate(Math.PI / 4);
+  x.fillStyle = "#b388ff";
+  x.strokeStyle = "#111";
+  x.lineWidth = 8;
+  x.fillRect(-26, -26, 52, 52);
+  x.strokeRect(-26, -26, 52, 52);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true }));
+}
+const _te = {};
+function pickTangent(e) {
+  if (selected < 0 || !pathData.waypoints[selected] || pathData.waypoints.length < 2) return null;
+  const n = pathData.waypoints.length;
+  tangentEnds(selected, _te);
+  let best = null, bestD = 20;
+  for (const side of ["fwd", "back"]) {
+    if ((side === "back" && selected === 0) || (side === "fwd" && selected === n - 1)) continue;
+    const sp = toScreen(_te[side]);
+    if (!sp) continue;
+    const d = Math.hypot(sp[0] - e.clientX, sp[1] - e.clientY);
+    if (d < bestD) { bestD = d; best = { i: selected, side }; }
+  }
+  return best;
+}
 
 function rebuildPath() {
   const wps = pathData.waypoints;
   curve = null;
   wpU = [];
+  wpT = [];
   if (pathLine) {
-    scene.remove(pathLine);
+    overlay.remove(pathLine);
     pathLine.geometry.dispose();
     pathLine = null;
   }
-  while (markers.children.length) {
-    const m = markers.children.pop();
-    m.geometry?.dispose();
-  }
+  disposeGroup(markers);
+  if (selected >= wps.length) selected = wps.length - 1;
   if (wps.length >= 2) {
-    const pts = wps.map((w) => new THREE.Vector3(...w.p));
-    curve = new THREE.CatmullRomCurve3(pts, false, "centripetal");
+    const { pts, hs } = handleVecs(wps);
+    curve = new BezierPath(pts, hs);
     const per = 100;
     curve.arcLengthDivisions = (wps.length - 1) * per;
     curve.updateArcLengths();
@@ -284,39 +655,101 @@ function rebuildPath() {
     wpU = wps.map((_, i) => lens[i * per] / total);
     wpU[0] = 0;
     wpU[wps.length - 1] = 1;
+    // timeline position: custom (dragged) time if set, else wherever the point sits along the route
+    const N = wps.length;
+    wpT = wps.map((w, i) => (i === 0 ? 0 : i === N - 1 ? 1 : w.t ?? wpU[i]));
+    for (let i = 1; i < N - 1; i++) wpT[i] = clamp(wpT[i], wpT[i - 1] + T_GAP, 1 - T_GAP * (N - 1 - i));
   }
   if (AUTHOR) {
+    const r = diag * 0.005;
     if (curve) {
-      const g = new THREE.BufferGeometry().setFromPoints(curve.getSpacedPoints(Math.max(50, wps.length * 60)));
-      pathLine = new THREE.Line(
-        g,
-        new THREE.LineBasicMaterial({ color: 0xffb454, depthTest: false, transparent: true })
-      );
+      // path as a thin tube with a start -> end colour gradient, so the flow direction reads at a glance
+      const segs = Math.max(120, wps.length * 60);
+      const radial = 6;
+      const g = new THREE.TubeGeometry(curve, segs, diag * 0.0016, radial, false);
+      const cols = new Float32Array(g.attributes.position.count * 3);
+      const c0 = new THREE.Color(0x6ee7a8), c1 = new THREE.Color(0xffb454), c2 = new THREE.Color(0xff5c8a);
+      const tmp = new THREE.Color();
+      for (let i = 0; i < g.attributes.position.count; i++) {
+        const t = Math.floor(i / (radial + 1)) / segs;
+        if (t < 0.5) tmp.copy(c0).lerp(c1, t * 2);
+        else tmp.copy(c1).lerp(c2, (t - 0.5) * 2);
+        cols.set([tmp.r, tmp.g, tmp.b], i * 3);
+      }
+      g.setAttribute("color", new THREE.BufferAttribute(cols, 3));
+      pathLine = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ vertexColors: true, depthTest: false }));
       pathLine.renderOrder = 999;
-      scene.add(pathLine);
+      overlay.add(pathLine);
+
+      // direction arrows every ~6% of the route
+      const up = new THREE.Vector3(0, 1, 0);
+      const arrows = Math.max(4, Math.round(1 / 0.06));
+      for (let k = 1; k < arrows; k++) {
+        const u = k / arrows;
+        const p = curve.getPointAt(u);
+        const tan = curve.getTangentAt(u).normalize();
+        const cone = new THREE.Mesh(
+          new THREE.ConeGeometry(r * 0.38, r * 1.3, 8),
+          new THREE.MeshBasicMaterial({ color: 0xffffff, depthTest: false, transparent: true, opacity: 0.6 })
+        );
+        cone.position.copy(p);
+        cone.quaternion.setFromUnitVectors(up, tan);
+        cone.renderOrder = 1000;
+        markers.add(cone);
+      }
     }
-    const r = diag * 0.004;
     wps.forEach((w, i) => {
-      const m = new THREE.Mesh(
-        new THREE.SphereGeometry(r, 12, 12),
-        new THREE.MeshBasicMaterial({ color: i === 0 ? 0x6ee7a8 : 0xffb454, depthTest: false })
-      );
+      const sel = i === selected;
+      const color = sel ? 0x5cc8ff : i === 0 ? 0x6ee7a8 : i === wps.length - 1 ? 0xff5c8a : 0xffb454;
+      // the point itself: a numbered ball (one sprite, so the number can never drift off the ball)
+      const m = makeBall(i + 1, color, sel);
       m.position.set(...w.p);
-      m.renderOrder = 1000;
-      // little nose showing where the camera looks
-      const q = new THREE.Quaternion(...w.q);
-      const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(q);
-      const nose = new THREE.Mesh(
-        new THREE.SphereGeometry(r * 0.5, 8, 8),
-        new THREE.MeshBasicMaterial({ color: 0xffffff, depthTest: false })
-      );
-      nose.position.copy(dir.multiplyScalar(r * 4));
-      nose.renderOrder = 1001;
-      m.add(nose);
+      m.userData.k = sel ? 1.35 : 1;
+      m.renderOrder = 1001;
       markers.add(m);
+
+      // look direction: a short line + dot showing where the camera is aimed at this point
+      const dir = new THREE.Vector3(0, 0, -1).applyQuaternion(new THREE.Quaternion(...w.q));
+      const tip = m.position.clone().addScaledVector(dir, LOOK_LEN());
+      const look = new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints([m.position.clone(), tip]),
+        new THREE.LineBasicMaterial({ color: sel ? 0x5cc8ff : 0xffffff, depthTest: false, transparent: true, opacity: 0.8 })
+      );
+      look.renderOrder = 1001;
+      markers.add(look);
+      const dot = makeHandle(sel);
+      dot.userData.k = sel ? 0.5 : 0.32;
+      dot.position.copy(tip);
+      dot.renderOrder = 1002;
+      markers.add(dot);
+
+
     });
+    // curve handles of the selected point (purple diamonds): drag to bend the path there
+    if (editing && selected >= 0 && wps.length >= 2) {
+      tangentEnds(selected, _te);
+      const w = wps[selected];
+      const ends = [];
+      if (selected < wps.length - 1) ends.push(_te.fwd);
+      if (selected > 0) ends.push(_te.back);
+      const base = new THREE.Vector3(...w.p);
+      ends.forEach((pt) => {
+        const ln = new THREE.Line(
+          new THREE.BufferGeometry().setFromPoints([base, pt]),
+          new THREE.LineBasicMaterial({ color: 0xb388ff, depthTest: false, transparent: true, opacity: 0.9 })
+        );
+        ln.renderOrder = 1001;
+        markers.add(ln);
+        const hd = makeTangentHandle();
+        hd.position.copy(pt);
+        hd.userData.k = 0.55;
+        hd.renderOrder = 1002;
+        markers.add(hd);
+      });
+    }
   }
   updateHud();
+  renderTimeline();
 }
 
 const _q0 = new THREE.Quaternion();
@@ -383,13 +816,142 @@ function startPose() {
  *  Input
  * ------------------------------------------------------------------ */
 let drag = null;
+const raycaster = new THREE.Raycaster();
+const _ndc = new THREE.Vector2();
+const _hit = new THREE.Vector3();
+const _pv = new THREE.Vector3();
+
+function toScreen(v3) {
+  _pv.copy(v3).project(camera);
+  if (_pv.z > 1 || _pv.z < -1) return null;
+  const r = canvas.getBoundingClientRect();
+  return [(_pv.x * 0.5 + 0.5) * r.width + r.left, (-_pv.y * 0.5 + 0.5) * r.height + r.top];
+}
+function setRay(e) {
+  const r = canvas.getBoundingClientRect();
+  _ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+  raycaster.setFromCamera(_ndc, camera);
+}
+// nearest waypoint within ~18px of the pointer (screen space, so it works through walls)
+function pickWaypoint(e) {
+  let best = -1, bestD = 30;
+  pathData.waypoints.forEach((w, i) => {
+    const sp = toScreen(_v3.set(...w.p));
+    if (!sp) return;
+    const d = Math.hypot(sp[0] - e.clientX, sp[1] - e.clientY);
+    if (d < bestD) { bestD = d; best = i; }
+  });
+  return best;
+}
+const _v3 = new THREE.Vector3();
+
+function selectPoint(i, msg) {
+  selected = i;
+  rebuildPath();
+  if (msg && i >= 0) hudFlash("Point " + (i + 1) + " selected · drag to move · V view · U update · ⌫ delete");
+}
+
 canvas.addEventListener("pointerdown", (e) => {
-  drag = { type: e.pointerType, x: e.clientX, y: e.clientY };
-  canvas.setPointerCapture(e.pointerId);
+  drag = { type: e.pointerType, x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY, moved: false, point: -1, look: -1, tan: null };
+  if (AUTHOR && !editing && mode === "free" && e.button === 0 && pickWaypoint(e) >= 0) {
+    hudFlash("Turn on ✎ Edit path (top right, or press M) to move points");
+  }
+  if (AUTHOR && editing && mode === "free" && e.button === 0) {
+    const th = pickTangent(e);
+    if (th) {
+      drag.tan = th;
+      tangentEnds(th.i, _te);
+      const tp = _te[th.side];
+      drag.plane = new THREE.Plane().setFromNormalAndCoplanarPoint(e.shiftKey ? new THREE.Vector3(0, 1, 0) : camera.getWorldDirection(new THREE.Vector3()), tp);
+      setRay(e);
+      const h0 = raycaster.ray.intersectPlane(drag.plane, new THREE.Vector3());
+      drag.offset = h0 ? h0.sub(tp) : new THREE.Vector3();
+      try { canvas.setPointerCapture(e.pointerId); } catch {}
+      document.body.classList.add("dragging");
+      return;
+    }
+    const lk = pickLook(e);
+    if (lk >= 0) {
+      drag.look = lk;
+      if (selected !== lk) selectPoint(lk);
+      try { canvas.setPointerCapture(e.pointerId); } catch {}
+      document.body.classList.add("dragging");
+      return;
+    }
+    const hit = pickWaypoint(e);
+    if (hit >= 0) {
+      drag.point = hit;
+      const w = pathData.waypoints[hit];
+      const p = new THREE.Vector3(...w.p);
+      // drag plane: facing the camera, or horizontal when Shift is held (keeps height)
+      const normal = e.shiftKey ? new THREE.Vector3(0, 1, 0) : camera.getWorldDirection(new THREE.Vector3());
+      drag.plane = new THREE.Plane().setFromNormalAndCoplanarPoint(normal, p);
+      setRay(e);
+      drag.offset = raycaster.ray.intersectPlane(drag.plane, new THREE.Vector3()) ? _hit.copy(raycaster.ray.intersectPlane(drag.plane, new THREE.Vector3())).sub(p).clone() : new THREE.Vector3();
+      if (selected !== hit) selectPoint(hit, true);
+    }
+  }
+  try {
+    canvas.setPointerCapture(e.pointerId);
+  } catch {}
   document.body.classList.add("dragging");
 });
 canvas.addEventListener("pointermove", (e) => {
+  if (AUTHOR && editing && !drag && mode === "free") canvas.style.cursor = pickTangent(e) || pickLook(e) >= 0 || pickWaypoint(e) >= 0 ? "grab" : "crosshair";
   if (!drag) return;
+  if (Math.hypot(e.clientX - drag.sx, e.clientY - drag.sy) > 4) drag.moved = true;
+  if (drag.tan) {
+    setRay(e);
+    const hit = raycaster.ray.intersectPlane(drag.plane, new THREE.Vector3());
+    if (hit) {
+      hit.sub(drag.offset);
+      const w = pathData.waypoints[drag.tan.i];
+      const v = hit.sub(new THREE.Vector3(...w.p));
+      if (drag.tan.side === "back") v.negate();
+      w.h = v.toArray().map((x) => +x.toFixed(5));
+      rebuildPath();
+    }
+    return;
+  }
+  if (drag.look >= 0) {
+    // aim: where the pointer ray meets a sphere around the point (or its closest approach)
+    setRay(e);
+    const w = pathData.waypoints[drag.look];
+    const c = _lt.set(...w.p);
+    const L = LOOK_LEN();
+    const ray = raycaster.ray;
+    const curTip = lookTip(drag.look, new THREE.Vector3());
+    const oc = ray.origin.clone().sub(c);
+    const bq = oc.dot(ray.direction), disc = bq * bq - (oc.lengthSq() - L * L);
+    let dirv;
+    if (disc >= 0) {
+      // the ray crosses the sphere twice; take the crossing nearest the current handle so it never flips to the far side
+      const sq = Math.sqrt(disc);
+      const a1 = ray.at(-bq - sq, new THREE.Vector3()), a2 = ray.at(-bq + sq, new THREE.Vector3());
+      dirv = (a1.distanceToSquared(curTip) < a2.distanceToSquared(curTip) ? a1 : a2).sub(c);
+    } else {
+      const t = Math.max(0, ray.direction.dot(c.clone().sub(ray.origin)));
+      dirv = ray.at(t, new THREE.Vector3()).sub(c);
+    }
+    if (dirv.lengthSq() > 1e-9) {
+      dirv.normalize();
+      const up = Math.abs(dirv.y) > 0.98 ? new THREE.Vector3(0, 0, -1) : new THREE.Vector3(0, 1, 0);
+      const mat = new THREE.Matrix4().lookAt(c, c.clone().add(dirv), up);
+      w.q = new THREE.Quaternion().setFromRotationMatrix(mat).toArray().map((v) => +v.toFixed(6));
+      rebuildPath();
+    }
+    return;
+  }
+  if (drag.point >= 0) {
+    setRay(e);
+    const hit = raycaster.ray.intersectPlane(drag.plane, new THREE.Vector3());
+    if (hit) {
+      hit.sub(drag.offset);
+      pathData.waypoints[drag.point].p = hit.toArray().map((v) => +v.toFixed(5));
+      rebuildPath();
+    }
+    return;
+  }
   const dx = e.clientX - drag.x,
     dy = e.clientY - drag.y;
   drag.x = e.clientX;
@@ -409,11 +971,52 @@ canvas.addEventListener("pointermove", (e) => {
   }
 });
 const endDrag = () => {
+  if (drag) {
+    if ((drag.point >= 0 || drag.look >= 0 || drag.tan) && drag.moved) save();
+    // plain click on empty space = deselect
+    else if (AUTHOR && drag.point < 0 && drag.look < 0 && !drag.tan && !drag.moved && selected >= 0) selectPoint(-1);
+  }
   drag = null;
   document.body.classList.remove("dragging");
 };
 canvas.addEventListener("pointerup", endDrag);
 canvas.addEventListener("pointercancel", endDrag);
+
+// double-click on the path line = add a point right there
+canvas.addEventListener("dblclick", (e) => {
+  if (!AUTHOR || !editing || mode !== "free") return;
+  const th = pickTangent(e);
+  if (th) {
+    delete pathData.waypoints[th.i].h;
+    save();
+    rebuildPath();
+    return hudFlash("Curve handle reset");
+  }
+  if (!curve) return;
+  const N = 400;
+  const pts = curve.getSpacedPoints(N);
+  let best = -1, bestD = 14;
+  pts.forEach((p, i) => {
+    const sp = toScreen(p);
+    if (!sp) return;
+    const d = Math.hypot(sp[0] - e.clientX, sp[1] - e.clientY);
+    if (d < bestD) { bestD = d; best = i; }
+  });
+  if (best < 0) return;
+  const u = best / N;
+  const wps = pathData.waypoints;
+  let j = 0;
+  while (j < wps.length - 2 && u > wpU[j + 1]) j++;
+  samplePath(u, _p, _pq);
+  wps.splice(j + 1, 0, {
+    p: _p.toArray().map((v) => +v.toFixed(5)),
+    q: _pq.toArray().map((v) => +v.toFixed(6)),
+  });
+  selected = j + 1;
+  save();
+  rebuildPath();
+  hudFlash("Point added · drag it to shape the route");
+});
 
 canvas.addEventListener(
   "wheel",
@@ -433,24 +1036,64 @@ canvas.addEventListener(
 window.addEventListener("keydown", (e) => {
   if (e.target instanceof HTMLInputElement) return;
   const k = e.key.toLowerCase();
+  if (AUTHOR && (e.ctrlKey || e.metaKey) && (k === "c" || k === "x" || k === "v")) {
+    e.preventDefault();
+    return clipboardOp(k, e.shiftKey);
+  }
+  if (AUTHOR && (e.ctrlKey || e.metaKey) && (k === "z" || k === "y")) {
+    e.preventDefault();
+    return stepHistory(k === "y" || e.shiftKey ? 1 : -1);
+  }
   if (k === "r" && !e.ctrlKey && !e.metaKey) return resetView();
   if (mode === "free") {
     if (["w", "a", "s", "d", "q", "e", "shift"].includes(k)) keys.add(k);
   }
   if (AUTHOR) {
+    // Space while the pointer is over the playbar = play / pause (instead of dropping a point)
+    if (k === " " && overBar && curve) {
+      e.preventDefault();
+      if (mode !== "tour") setMode("tour");
+      togglePlay();
+      return;
+    }
     if (k === " " && mode === "free") {
       e.preventDefault();
       addWaypoint();
       return;
     }
-    if (k === "backspace") {
+    if (k === "backspace" || k === "delete") {
       e.preventDefault();
-      if (e.shiftKey) pathData.waypoints = [];
-      else pathData.waypoints.pop();
+      if (e.shiftKey) {
+        pathData.waypoints = [];
+        selected = -1;
+      } else if (selected >= 0) {
+        pathData.waypoints.splice(selected, 1);
+        selected = Math.min(selected, pathData.waypoints.length - 1);
+      } else {
+        pathData.waypoints.pop();
+      }
       save();
       rebuildPath();
       if (!curve && mode === "tour") setMode("free");
       return;
+    }
+    if (k === "m") return setEditing(!editing);
+    if (k === "l") return window.__togglePts();
+    if (k === "escape") return selectPoint(-1);
+    if (k === "v" && selected >= 0) return viewFrom(selected);
+    if (k === "u" && selected >= 0 && mode === "free") {
+      const w = pathData.waypoints[selected];
+      w.p = camera.position.toArray().map((v) => +v.toFixed(5));
+      w.q = camera.quaternion.toArray().map((v) => +v.toFixed(6));
+      save();
+      rebuildPath();
+      return hudFlash("Point " + (selected + 1) + " updated to this view");
+    }
+    if ((k === "[" || k === "]") && pathData.waypoints.length) {
+      const n = pathData.waypoints.length;
+      const i = selected < 0 ? (k === "]" ? 0 : n - 1) : (selected + (k === "]" ? 1 : -1) + n) % n;
+      selectPoint(i);
+      return viewFrom(i);
     }
     if (k === "o") return cycleOrientation();
     if (k === "g") {
@@ -501,6 +1144,9 @@ function togglePlay() {
   playing = !playing;
   $("playBtn").textContent = playing ? "❚❚" : "▶";
 }
+let overBar = false;
+$("ui").addEventListener("pointerenter", () => (overBar = true));
+$("ui").addEventListener("pointerleave", () => (overBar = false));
 $("playBtn").addEventListener("click", () => {
   if (mode !== "tour") setMode("tour");
   togglePlay();
@@ -546,12 +1192,59 @@ document.addEventListener("click", (e) => {
 });
 
 function addWaypoint() {
-  pathData.waypoints.push({
+  const wp = {
     p: camera.position.toArray().map((v) => +v.toFixed(5)),
     q: camera.quaternion.toArray().map((v) => +v.toFixed(6)),
-  });
+  };
+  if (selected >= 0) {
+    // a point is selected: slot the new one in right after it
+    pathData.waypoints.splice(selected + 1, 0, wp);
+    selected += 1;
+  } else {
+    pathData.waypoints.push(wp);
+  }
   save();
   rebuildPath();
+}
+
+// copy / cut / paste of a point (author mode). Paste drops the copy where the camera is now (keeping its look direction
+// and curve handle); Ctrl+Shift+V pastes it back at its original spot.
+let pointClip = null;
+function clipboardOp(k, inPlace) {
+  const wps = pathData.waypoints;
+  if (k === "c" || k === "x") {
+    if (selected < 0 || !wps[selected]) return hudFlash("Select a point first");
+    pointClip = JSON.parse(JSON.stringify(wps[selected]));
+    delete pointClip.t;
+    try { navigator.clipboard?.writeText(JSON.stringify(pointClip)); } catch {}
+    if (k === "c") return hudFlash("Copied point " + (selected + 1) + " · Ctrl+V to paste");
+    wps.splice(selected, 1);
+    selected = Math.min(selected, wps.length - 1);
+    save();
+    rebuildPath();
+    if (!curve && mode === "tour") setMode("free");
+    return hudFlash("Cut point · Ctrl+V to paste");
+  }
+  if (!pointClip) return hudFlash("Nothing copied yet");
+  const w = JSON.parse(JSON.stringify(pointClip));
+  if (!inPlace && mode === "free") w.p = camera.position.toArray().map((v) => +v.toFixed(5));
+  const at = selected >= 0 ? selected + 1 : wps.length;
+  wps.splice(at, 0, w);
+  selected = at;
+  save();
+  rebuildPath();
+  hudFlash("Pasted as point " + (at + 1) + (inPlace || mode !== "free" ? " (original spot)" : " (at the camera)"));
+}
+
+function viewFrom(i) {
+  const w = pathData.waypoints[i];
+  if (!w) return;
+  if (mode === "tour") setMode("free");
+  camera.position.set(...w.p);
+  camera.quaternion.set(...w.q);
+  syncYawPitchFromCamera();
+  vel.set(0, 0, 0);
+  hudFlash("Viewing from point " + (i + 1));
 }
 
 function cycleOrientation() {
@@ -564,7 +1257,10 @@ function cycleOrientation() {
   pathData.waypoints = pathData.waypoints.map((w) => {
     const p = new THREE.Vector3(...w.p).applyQuaternion(delta);
     const q = delta.clone().multiply(new THREE.Quaternion(...w.q));
-    return { p: p.toArray(), q: q.toArray() };
+    const out = { p: p.toArray(), q: q.toArray() };
+    if (w.t != null) out.t = w.t;
+    if (w.h) out.h = new THREE.Vector3(...w.h).applyQuaternion(delta).toArray();
+    return out;
   });
   save();
   rebuildPath();
@@ -638,7 +1334,7 @@ function frame(now) {
       }
     }
     tourU += (tourTarget - tourU) * (1 - Math.exp(-dt * 4));
-    samplePath(tourU, _p, _pq);
+    samplePath(tlToU(tourU), _p, _pq);
     camera.position.copy(_p);
     if (!drag) {
       const k = Math.exp(-dt * 1.4);
@@ -649,9 +1345,28 @@ function frame(now) {
     _tq.copy(_pq).multiply(_off);
     camera.quaternion.slerp(_tq, 1 - Math.exp(-dt * 6));
     if (document.activeElement !== $("slider")) $("slider").value = Math.round(tourTarget * 1000);
+    if (AUTHOR) $("clock").textContent = fmtT(tourU * pathData.duration) + " / " + fmtT(pathData.duration);
   }
 
+  if (AUTHOR) {
+    // hide the route decorations while previewing so they do not clutter the shot
+    markers.visible = mode !== "tour";
+    if (pathLine) pathLine.visible = mode !== "tour";
+    // keep number labels a steady size on screen, near or far
+    for (const m of markers.children) {
+      if (!m.isSprite) continue;
+      const d = camera.position.distanceTo(m.position);
+      const sc = clamp(d * 0.05, diag * 0.004, diag * 0.06) * (m.userData.k || 1);
+      m.scale.set(sc, sc, 1);
+    }
+  }
+
+  renderer.clear();
   renderer.render(scene, camera);
+  if (AUTHOR) {
+    renderer.clearDepth();
+    renderer.render(overlay, camera);
+  }
 }
 
 /* ------------------------------------------------------------------ *
@@ -668,4 +1383,20 @@ $("loader").classList.add("done");
 if (AUTHOR) {
   hudFlash(pathData.waypoints.length ? "Loaded your saved path" : "Fly to a spot, press Space to drop a point");
 }
-window.__tour = { camera, mesh, pathData, setMode, get mode() { return mode; } };
+if (AUTHOR) {
+  document.body.classList.add("author");
+  const pb = $("ptsBtn");
+  pb.hidden = false;
+  const togglePts = () => {
+    $("pts").hidden = !$("pts").hidden;
+    pb.classList.toggle("on", !$("pts").hidden);
+  };
+  pb.addEventListener("click", togglePts);
+  window.__togglePts = togglePts;
+  $("pts").hidden = false;
+  pb.classList.add("on");
+  const eb = $("editBtn");
+  eb.hidden = false;
+  eb.addEventListener("click", () => setEditing(!editing));
+}
+window.__tour = { overlay, markers, diagv: () => diag, scene, renderer, camera, mesh, pathData, setMode, get mode() { return mode; }, setEditing };
