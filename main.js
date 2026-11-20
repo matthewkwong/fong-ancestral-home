@@ -45,12 +45,16 @@ const ORIENTATIONS = [
  *  Path data  { orientation, duration, waypoints:[{p:[x,y,z], q:[x,y,z,w]}] }
  * ------------------------------------------------------------------ */
 let pathData = null;
+// path.json is the source of truth. In author mode, edits are also kept as a draft in this browser so a refresh doesn't lose them,
+// but a draft is only used while it still builds on the current path.json; replace path.json and the stale draft is dropped.
+const fileJSON = await fetchJSON("./path.json", null);
+const fileSig = fileJSON ? JSON.stringify(fileJSON) : "";
 if (AUTHOR) {
   try {
-    pathData = JSON.parse(localStorage.getItem(STORE_KEY) || "null");
+    if (localStorage.getItem(STORE_KEY + ":base") === fileSig) pathData = JSON.parse(localStorage.getItem(STORE_KEY) || "null");
   } catch {}
 }
-if (!pathData) pathData = await fetchJSON("./path.json", null);
+if (!pathData) pathData = fileJSON;
 if (!pathData) pathData = { orientation: cfg.orientation ?? 3, duration: cfg.duration ?? 90, waypoints: [] };
 pathData.waypoints ??= [];
 pathData.duration ??= cfg.duration ?? 90;
@@ -70,6 +74,7 @@ function record() {
 function persist() {
   try {
     localStorage.setItem(STORE_KEY, JSON.stringify(pathData));
+    localStorage.setItem(STORE_KEY + ":base", fileSig);
   } catch {}
 }
 function save() {
@@ -485,9 +490,27 @@ function jumpTo(i) {
 }
 // Which chapter the playhead is in: that one's dot lights up, the rest stay grey.
 let chapterEls = [], nowIdx = -2;
+let glide = null; // eased jump between chapters: {from,to,t,dur,last}
 function updateNow(u) {
   let idx = -1;
   for (let k = 0; k < chapterEls.length; k++) if (chapterEls[k].u <= u + 0.002) idx = k;
+  setNow(idx);
+}
+// Free roam: light up the chapter whose spot is nearest to where you are (with a little stickiness so it doesn't flicker on borders).
+function updateNowFree(pos) {
+  let best = -1, bd = Infinity, cur = Infinity;
+  for (let k = 0; k < chapterEls.length; k++) {
+    const p = chapterEls[k].p;
+    if (!p) continue;
+    const d = Math.hypot(pos.x - p[0], pos.y - p[1], pos.z - p[2]);
+    if (k === nowIdx) cur = d;
+    if (d < bd) { bd = d; best = k; }
+  }
+  if (best < 0) return;
+  if (nowIdx >= 0 && best !== nowIdx && bd > cur * 0.85) return;
+  setNow(best);
+}
+function setNow(idx) {
   if (idx === nowIdx) return;
   nowIdx = idx;
   chapterEls.forEach((c, k) => {
@@ -513,7 +536,29 @@ function renderChapters() {
   named.forEach(({ w, i }, k) => {
     const u = wpT[i] ?? 0;
     const go = () => {
-      if (mode !== "tour") setMode("tour");
+      // Exploring freely: stay in free roam. Dip to black, drop the camera at that chapter's view, fade back in.
+      if (mode === "free") {
+        clearTimeout(setMode.t);
+        clearTimeout(go.t);
+        const placeHere = () => {
+          samplePathT(u, _p, _pq);
+          camera.position.copy(_p);
+          camera.quaternion.copy(_pq);
+          vel.set(0, 0, 0);
+          syncYawPitchFromCamera();
+          if (chapterEls.length) updateNowFree(camera.position);
+        };
+        const v = $("veil");
+        if (!v || matchMedia("(prefers-reduced-motion: reduce)").matches) return placeHere();
+        v.style.transitionDuration = "0.22s";
+        v.style.opacity = "1";
+        go.t = setTimeout(() => {
+          placeHere();
+          v.style.transitionDuration = "0.45s";
+          v.style.opacity = "0";
+        }, 240);
+        return;
+      }
       // Dip to black, jump while the screen is dark, then fade back in: a cut would feel abrupt. (The Chapters list stays open.)
       const veil = $("veil");
       clearTimeout(go.t);
@@ -539,7 +584,7 @@ function renderChapters() {
     row.querySelector(".nm").textContent = w.name;
     row.addEventListener("click", go);
     list.appendChild(row);
-    chapterEls.push({ u, row, mk });
+    chapterEls.push({ u, row, mk, p: w.p });
   });
 }
 
@@ -1067,8 +1112,43 @@ const _pq = new THREE.Quaternion();
 const _off = new THREE.Quaternion();
 const _tq = new THREE.Quaternion();
 
-function setMode(m) {
+// Where on the tour path is closest to a spot in the scene (coarse scan, then a finer pass around the best hit).
+const _np = new THREE.Vector3(), _nq = new THREE.Quaternion();
+function nearestTourU(pos) {
+  let best = 0, bd = Infinity;
+  const scan = (a, b, n) => {
+    for (let i = 0; i <= n; i++) {
+      const u = a + ((b - a) * i) / n;
+      samplePathT(u, _np, _nq);
+      const d = _np.distanceToSquared(pos);
+      if (d < bd) { bd = d; best = u; }
+    }
+  };
+  scan(0, 1, 600);
+  scan(Math.max(0, best - 0.003), Math.min(1, best + 0.003), 60);
+  return best;
+}
+function setMode(m, immediate) {
   if (m === "tour" && !curve) return;
+  if (mode === "free" && m === "tour" && !AUTHOR && !immediate) {
+    // Visitors: pick the tour up from the spot nearest to where they are, hidden behind a quick dip to black.
+    const veil = $("veil");
+    const u = nearestTourU(camera.position);
+    if (!veil || matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      setMode("tour", true);
+      return snapTour(u);
+    }
+    clearTimeout(setMode.t);
+    veil.style.transitionDuration = "0.22s";
+    veil.style.opacity = "1";
+    setMode.t = setTimeout(() => {
+      setMode("tour", true);
+      snapTour(u);
+      veil.style.transitionDuration = "0.45s";
+      veil.style.opacity = "0";
+    }, 240);
+    return;
+  }
   if (mode === "free" && m === "tour") {
     // keep the playhead where it was, so going back to the tour resumes instead of restarting; with a point selected it starts at that point
     if (AUTHOR && selected >= 0 && wpT[selected] != null) snapTour(wpT[selected]); // start right at the selected point
@@ -1332,6 +1412,12 @@ window.addEventListener("keydown", (e) => {
     return stepHistory(k === "y" || e.shiftKey ? 1 : -1);
   }
   if (k === "r" && !e.ctrlKey && !e.metaKey) return resetView();
+  if (k === "t" && !e.ctrlKey && !e.metaKey && !e.altKey && !e.repeat) {
+    // T flips between the guided tour and free roam (needs a path to tour along)
+    if (mode === "tour") return setMode("free");
+    if (curve) return setMode("tour");
+    return;
+  }
   if (mode === "free") {
     if (["w", "a", "s", "d", "q", "e", "shift"].includes(k)) keys.add(k);
   }
@@ -1698,8 +1784,17 @@ function frame(now) {
         if (vel.y < 0) vel.y = 0;
       }
     }
+    if (chapterEls.length) updateNowFree(camera.position);
   } else if (curve) {
-    if (playing) {
+    if (glide && tourTarget !== glide.last) glide = null; // the user scrubbed or scrolled: hand control back
+    if (glide) {
+      glide.t += dt;
+      const x = Math.min(1, glide.t / glide.dur);
+      const e = x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2; // easeInOutCubic
+      tourTarget = tourU = glide.from + (glide.to - glide.from) * e;
+      glide.last = tourTarget;
+      if (x >= 1) glide = null;
+    } else if (playing) {
       tourTarget = Math.min(1, tourTarget + dt / Math.max(pathData.duration, 5));
       if (tourTarget >= 1) {
         playing = false;
@@ -1770,6 +1865,11 @@ if (!AUTHOR) {
     pb.classList.toggle("on", !$("pts").hidden);
   });
   renderChapters();
+  // Desktop: start with the Chapters list open (phones keep it closed to save room).
+  if (!matchMedia("(max-width:640px), (pointer:coarse)").matches && !pb.hidden) {
+    $("pts").hidden = false;
+    pb.classList.add("on");
+  }
 }
 if (AUTHOR) {
   document.body.classList.add("author");

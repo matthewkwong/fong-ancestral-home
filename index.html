@@ -14,7 +14,7 @@
 
   #veil { position:fixed; inset:0; background:#0b0b0c; opacity:0; pointer-events:none; z-index:1; transition:opacity .3s ease; }
   #title, #hint, #ui, #ptsRow, #pts, #flash, #author, #editBtn, #prevBtn, #paceBtn { z-index:2; }
-  #title { position:fixed; left:20px; top:18px; font-size:15px; letter-spacing:.04em; text-shadow:0 1px 12px #000a; pointer-events:none; }
+  #title { display:none; position:fixed; left:20px; top:18px; font-size:15px; letter-spacing:.04em; text-shadow:0 1px 12px #000a; pointer-events:none; }
 
   #loader { position:fixed; inset:0; display:grid; place-content:center; gap:14px; text-align:center;
     background:#0b0b0c; transition:opacity .8s ease, visibility .8s; z-index:10; }
@@ -42,16 +42,19 @@
   #playBtn, #modeBtn, #clock { margin-bottom:0; }
   #playBtn, #modeBtn { align-self:flex-end; margin-bottom:2px; }
   #ptsRow { position:fixed; right:20px; top:136px; display:flex; gap:8px; }
-  #ptsRow button { background:#141416cc; backdrop-filter:blur(14px); }
+  #ptsRow button { background:#141416d9; backdrop-filter:blur(14px); height:36px; box-sizing:border-box; padding-top:0; padding-bottom:0; border-color:#ffffff1f; }
   body:not(.has-path) #modeBtn { display:none; }
   #ui { transition:opacity .45s ease, transform .3s ease, visibility .45s; }
   body:not(.author)[data-mode="free"] #ui { opacity:0; visibility:hidden; pointer-events:none; transform:translateY(90px); }
   @keyframes fadeIn { from { opacity:0 } to { opacity:1 } }
-  .tour-hint, .free-hint, #pts:not([hidden]), #ptsRow button { animation:fadeIn .45s ease; }
-  @media (prefers-reduced-motion:reduce) { #ui, .tour-hint, .free-hint, #pts, #ptsRow button { transition:none; animation:none; } }
+  .tour-hint, .free-hint, #ptsRow button { animation:fadeIn .45s ease; }
+  @media (prefers-reduced-motion:reduce) { #ui, .tour-hint, .free-hint, #pts, #ptsRow button { transition:none !important; animation:none; } }
   #pts { position:fixed; right:20px; top:176px; width:230px; max-height:calc(100vh - 176px - 110px); overflow:auto; padding:8px; border-radius:12px;
     background:#141416e6; backdrop-filter:blur(14px); border:1px solid #ffffff1a; font-size:13px; }
-  #pts[hidden] { display:none; }
+  /* Chapters panel eases in and out (display is animated too, so hiding waits for the fade) */
+  #pts { transition:opacity .4s cubic-bezier(.22,.61,.36,1), transform .4s cubic-bezier(.22,.61,.36,1), display .4s allow-discrete, overlay .4s allow-discrete; transform-origin:top right; }
+  #pts[hidden] { display:none; opacity:0; transform:translateY(-10px) scale(.98); }
+  @starting-style { #pts:not([hidden]) { opacity:0; transform:translateY(-10px) scale(.98); } }
   #pts .empty { color:var(--dim); padding:8px; }
   #pts .pt { display:flex; align-items:center; gap:10px; padding:6px 8px; border-radius:8px; cursor:pointer; }
   #pts .pt:hover { background:#ffffff14; }
@@ -78,8 +81,8 @@
   #slider { flex:1; accent-color:var(--fg); min-width:60px; }
 
   #editBtn { position:fixed; right:20px; top:96px; background:#141416cc; backdrop-filter:blur(14px); }
-  body:not(.author) #ptsRow { top:56px; }
-  body:not(.author) #pts { top:96px; }
+  body:not(.author) #ptsRow { top:18px; }
+  body:not(.author) #pts { top:62px; }
   body.previewing #ptsRow { top:96px; }
   body.previewing #pts { top:136px; }
   body.chapters #marks { display:block; }
@@ -96,7 +99,9 @@
   #prevBtn.on { background:var(--accent); color:#111; }
   #ptsBtn.on, #editBtn.on { background:var(--accent); color:#111; }
   body.editing canvas { cursor:crosshair; }
-  #hint { position:fixed; right:20px; top:18px; color:var(--dim); font-size:12px; text-align:right; pointer-events:none; text-shadow:0 1px 10px #000a; }
+  /* Top-left legend: a dark frosted pill so it reads over bright or busy parts of the scene */
+  #hint { position:fixed; left:20px; top:18px; max-width:min(420px, calc(100vw - 300px)); color:#f3efe8; font-size:12.5px; line-height:1.45; letter-spacing:.01em; text-align:left; pointer-events:none;
+    padding:8px 14px; border-radius:10px; background:#141416d9; backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px); border:1px solid #ffffff1f; box-shadow:0 4px 18px #0006; }
   body[data-mode="free"] .tour-hint, body[data-mode="free"] .tour-hint-touch, body[data-mode="tour"] .free-hint { display:none; }
 
   #author { position:fixed; left:20px; top:52px; padding:12px 14px; border-radius:12px; background:#141416d9;
@@ -129,7 +134,7 @@
   /* phones: no title; the control hint is a solid dark strip across the top, in plain bright text */
   @media (max-width:640px), (pointer:coarse) {
     #title { display:none; }
-    #hint { left:0; right:0; top:0; bottom:auto; text-align:center; background:#17171a; color:#f3efe8; text-shadow:none; z-index:3;
+    #hint { left:0; right:0; top:0; bottom:auto; max-width:none; border:0; border-radius:0; box-shadow:none; backdrop-filter:none; -webkit-backdrop-filter:none; text-align:center; background:#17171a; color:#f3efe8; text-shadow:none; z-index:3;
       font-size:13px; line-height:18px; padding:calc(9px + env(safe-area-inset-top)) 16px 9px; }
     #resetBtn { display:none; width:38px; height:38px; padding:0; border-radius:50%; font-size:18px; line-height:1; flex:none; }
     #resetBtn .lbl { display:none; }
@@ -148,7 +153,7 @@
   <button id="paceBtn" hidden title="Spread the points over a set time with comfortable speed and turns">⏱ Auto-pace</button>
   <button id="prevBtn" hidden title="See what visitors will see">👁 Preview</button>
   <div id="ptsRow">
-    <button id="modeBtn">Explore freely</button>
+    <button id="modeBtn" title="Switch between tour and free roam (T)">Explore freely (T)</button>
     <button id="ptsBtn" hidden title="List of points (L)">☰ Points</button>
   </div>
   <div id="pts" hidden></div>
