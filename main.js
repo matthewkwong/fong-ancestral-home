@@ -115,6 +115,29 @@ const spark = new SparkRenderer({
 });
 scene.add(spark);
 
+/* Remember the splat on the visitor's device. A small service worker (sw.js) keeps the big file in the browser's Cache
+   Storage after the first download, so later visits load it from the device instead of the network. Only on https
+   (service workers need it) and never in author mode, where the file changes while you work. Add ?nocache to skip it. */
+async function enableSplatCache() {
+  if (AUTHOR || params.has("nocache") || !("serviceWorker" in navigator) || location.protocol !== "https:") return;
+  try {
+    await navigator.serviceWorker.register("./sw.js");
+    await navigator.serviceWorker.ready;
+    if (!navigator.serviceWorker.controller) {
+      // first visit: give the worker a moment to take over this page so the download below goes through it
+      await Promise.race([
+        new Promise((r) => navigator.serviceWorker.addEventListener("controllerchange", r, { once: true })),
+        new Promise((r) => setTimeout(r, 2500)),
+      ]);
+    }
+    navigator.storage?.persist?.();
+  } catch (e) {
+    console.warn("splat cache unavailable", e);
+  }
+}
+// never let the saving step hold up the page: if it is not ready within 4 seconds, load the splat the normal way
+await Promise.race([enableSplatCache(), new Promise((r) => setTimeout(r, 4000))]);
+
 const mesh = new SplatMesh({
   url: SPLAT_URL,
   lod: params.has("nolod") ? false : cfg.lod ?? false,
@@ -1222,17 +1245,15 @@ canvas.addEventListener("pointermove", (e) => {
   drag.x = e.clientX;
   drag.y = e.clientY;
   if (mode === "free") {
-    yaw -= dx * 0.003;
-    pitch = clamp(pitch - dy * 0.003, -1.5, 1.5);
+    const sens = drag.type === "touch" ? 0.0042 : 0.003; // fingers need a little more turn per pixel
+    yaw -= dx * sens;
+    pitch = clamp(pitch - dy * sens, -1.5, 1.5);
     setCameraFromYawPitch();
   } else {
-    lookYaw = wrapPi(lookYaw - dx * 0.003); // no limit: look all the way around (360°)
-    if (drag.type === "touch") {
-      tourTarget = clamp(tourTarget - dy * 0.0018, 0, 1);
-      playing = false;
-    } else {
-      lookPitch = clamp(lookPitch - dy * 0.003, -1.45, 1.45);
-    }
+    // Dragging the scene only ever looks around (360° sideways, up and down); on a phone too. Only the timeline bar moves playback.
+    const sens = drag.type === "touch" ? 0.0042 : 0.003;
+    lookYaw = wrapPi(lookYaw - dx * sens);
+    lookPitch = clamp(lookPitch - dy * sens, -1.45, 1.45);
   }
 });
 const wrapPi = (a) => a - Math.PI * 2 * Math.floor((a + Math.PI) / (Math.PI * 2)); // keep an angle in -180°..180° so easing back takes the short way round
@@ -1411,7 +1432,49 @@ window.addEventListener("keydown", (e) => {
   }
 });
 window.addEventListener("keyup", (e) => keys.delete(e.key.toLowerCase()));
-window.addEventListener("blur", () => keys.clear());
+window.addEventListener("blur", () => { keys.clear(); resetStick(); });
+
+/* ---- touch controls for free roam: left stick moves, drag anywhere else to look, Up / Down buttons ---- */
+const joy = { x: 0, y: 0, mag: 0 };
+const padEl = $("pad"), stickEl = $("stick");
+function resetStick() {
+  joy.x = joy.y = joy.mag = 0;
+  if (stickEl) { stickEl.style.transform = "translate(-50%,-50%)"; padEl.classList.remove("fast"); }
+}
+if (padEl) {
+  let padId = null;
+  const move = (e) => {
+    const r = padEl.getBoundingClientRect();
+    const R = r.width / 2 - 26;
+    let dx = e.clientX - (r.left + r.width / 2), dy = e.clientY - (r.top + r.height / 2);
+    const len = Math.hypot(dx, dy);
+    if (len > R) { dx = (dx / len) * R; dy = (dy / len) * R; }
+    joy.x = dx / R;
+    joy.y = dy / R;
+    joy.mag = Math.min(1, Math.hypot(joy.x, joy.y));
+    stickEl.style.transform = "translate(calc(-50% + " + dx + "px), calc(-50% + " + dy + "px))";
+    padEl.classList.toggle("fast", joy.mag > 0.95);
+  };
+  padEl.addEventListener("pointerdown", (e) => {
+    padId = e.pointerId;
+    try { padEl.setPointerCapture(e.pointerId); } catch {}
+    move(e);
+  });
+  padEl.addEventListener("pointermove", (e) => { if (e.pointerId === padId) move(e); });
+  const end = (e) => { if (e.pointerId === padId) { padId = null; resetStick(); } };
+  padEl.addEventListener("pointerup", end);
+  padEl.addEventListener("pointercancel", end);
+  for (const [id, key] of [["upBtn", "e"], ["dnBtn", "q"]]) {
+    const b = $(id);
+    if (!b) continue;
+    b.addEventListener("pointerdown", (e) => { e.preventDefault(); try { b.setPointerCapture(e.pointerId); } catch {} keys.add(key); b.classList.add("held"); });
+    const up = () => { keys.delete(key); b.classList.remove("held"); };
+    b.addEventListener("pointerup", up);
+    b.addEventListener("pointercancel", up);
+  }
+  // leaving free fly mid-touch must not leave the camera drifting
+  new MutationObserver(resetStick).observe(document.body, { attributes: true, attributeFilter: ["data-mode"] });
+}
 
 window.addEventListener("resize", () => {
   camera.aspect = window.innerWidth / window.innerHeight;
@@ -1601,6 +1664,7 @@ function updateHud() {
  *  Frame loop
  * ------------------------------------------------------------------ */
 let last = performance.now();
+let tourOver = false;
 let lastLook = 0;
 function frame(now) {
   const dt = Math.min((now - last) / 1000, 0.1);
@@ -1618,6 +1682,13 @@ function frame(now) {
     if (keys.has("e")) wish.y += 1;
     if (keys.has("q")) wish.y -= 1;
     if (wish.lengthSq() > 0) wish.normalize().multiplyScalar(s);
+    if (joy.mag > 0.08) {
+      // touch stick: analog speed, push to the rim to sprint; Up / Down buttons still work through the keys set
+      const jv = new THREE.Vector3().addScaledVector(fwd, -joy.y).addScaledVector(right, joy.x);
+      jv.multiplyScalar(s * (joy.mag > 0.95 ? 1.8 : 1));
+      jv.y += wish.y;
+      wish.copy(jv);
+    }
     vel.lerp(wish, 1 - Math.exp(-dt * 10));
     camera.position.addScaledVector(vel, dt);
     if (GROUND.on && floorGrid) {
@@ -1649,6 +1720,8 @@ function frame(now) {
     _tq.copy(_pq).multiply(_off);
     camera.quaternion.slerp(_tq, 1 - Math.exp(-dt * 6));
     if (chapterEls.length) updateNow(tourU);
+    const over = tourTarget >= 0.999 && tourU >= 0.99;
+    if (over !== tourOver) { tourOver = over; document.body.classList.toggle("ended", over); } // phones show Restart only once the tour is over
     if (document.activeElement !== $("slider")) $("slider").value = Math.round(tourTarget * 1000);
     if (AUTHOR) $("clock").textContent = fmtT(tourU * pathData.duration) + " / " + fmtT(pathData.duration);
   }
