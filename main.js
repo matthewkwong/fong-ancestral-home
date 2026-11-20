@@ -460,6 +460,18 @@ function jumpTo(i) {
     $("playBtn").textContent = "▶";
   } else viewFrom(i);
 }
+// Which chapter the playhead is in: that one's dot lights up, the rest stay grey.
+let chapterEls = [], nowIdx = -2;
+function updateNow(u) {
+  let idx = -1;
+  for (let k = 0; k < chapterEls.length; k++) if (chapterEls[k].u <= u + 0.002) idx = k;
+  if (idx === nowIdx) return;
+  nowIdx = idx;
+  chapterEls.forEach((c, k) => {
+    c.row.classList.toggle("now", k === idx);
+    c.mk.classList.toggle("now", k === idx);
+  });
+}
 // Visitor view: only the points you gave a name become chapters, on the timeline and in a small menu.
 function renderChapters() {
   const wps = pathData.waypoints, dur = pathData.duration;
@@ -467,6 +479,8 @@ function renderChapters() {
   const btn = $("ptsBtn"), list = $("pts"), marks = $("marks");
   marks.innerHTML = "";
   list.innerHTML = "";
+  chapterEls = [];
+  nowIdx = -2;
   document.body.classList.toggle("chapters", named.length > 0);
   btn.hidden = named.length === 0;
   if (!named.length) {
@@ -477,9 +491,17 @@ function renderChapters() {
     const u = wpT[i] ?? 0;
     const go = () => {
       if (mode !== "tour") setMode("tour");
-      snapTour(u);
-      list.hidden = true;
-      btn.classList.remove("on");
+      // Dip to black, jump while the screen is dark, then fade back in: a cut would feel abrupt. (The Chapters list stays open.)
+      const veil = $("veil");
+      clearTimeout(go.t);
+      if (!veil || matchMedia("(prefers-reduced-motion: reduce)").matches) return snapTour(u);
+      veil.style.transitionDuration = "0.22s";
+      veil.style.opacity = "1";
+      go.t = setTimeout(() => {
+        snapTour(u);
+        veil.style.transitionDuration = "0.45s";
+        veil.style.opacity = "0";
+      }, 240);
     };
     const mk = document.createElement("div");
     mk.className = "ch";
@@ -494,6 +516,7 @@ function renderChapters() {
     row.querySelector(".nm").textContent = w.name;
     row.addEventListener("click", go);
     list.appendChild(row);
+    chapterEls.push({ u, row, mk });
   });
 }
 
@@ -1625,6 +1648,7 @@ function frame(now) {
     _off.setFromEuler(euler.set(lookPitch, lookYaw, 0, "YXZ"));
     _tq.copy(_pq).multiply(_off);
     camera.quaternion.slerp(_tq, 1 - Math.exp(-dt * 6));
+    if (chapterEls.length) updateNow(tourU);
     if (document.activeElement !== $("slider")) $("slider").value = Math.round(tourTarget * 1000);
     if (AUTHOR) $("clock").textContent = fmtT(tourU * pathData.duration) + " / " + fmtT(pathData.duration);
   }

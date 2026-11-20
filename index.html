@@ -12,6 +12,8 @@
   canvas { position:fixed; inset:0; width:100%; height:100%; display:block; touch-action:none; cursor:grab; }
   body.dragging canvas { cursor:grabbing; }
 
+  #veil { position:fixed; inset:0; background:#0b0b0c; opacity:0; pointer-events:none; z-index:1; transition:opacity .3s ease; }
+  #title, #hint, #ui, #ptsRow, #pts, #flash, #author, #editBtn, #prevBtn, #paceBtn { z-index:2; }
   #title { position:fixed; left:20px; top:18px; font-size:15px; letter-spacing:.04em; text-shadow:0 1px 12px #000a; pointer-events:none; }
 
   #loader { position:fixed; inset:0; display:grid; place-content:center; gap:14px; text-align:center;
@@ -39,7 +41,14 @@
   body.author #clock { display:block; }
   #playBtn, #modeBtn, #clock { margin-bottom:0; }
   #playBtn, #modeBtn { align-self:flex-end; margin-bottom:2px; }
-  #ptsBtn { position:fixed; right:20px; top:136px; background:#141416cc; backdrop-filter:blur(14px); }
+  #ptsRow { position:fixed; right:20px; top:136px; display:flex; gap:8px; }
+  #ptsRow button { background:#141416cc; backdrop-filter:blur(14px); }
+  body:not(.has-path) #modeBtn { display:none; }
+  #ui { transition:opacity .45s ease, transform .3s ease, visibility .45s; }
+  body:not(.author)[data-mode="free"] #ui { opacity:0; visibility:hidden; pointer-events:none; transform:translateY(90px); }
+  @keyframes fadeIn { from { opacity:0 } to { opacity:1 } }
+  .tour-hint, .free-hint, #pts:not([hidden]), #ptsRow button { animation:fadeIn .45s ease; }
+  @media (prefers-reduced-motion:reduce) { #ui, .tour-hint, .free-hint, #pts, #ptsRow button { transition:none; animation:none; } }
   #pts { position:fixed; right:20px; top:176px; width:230px; max-height:calc(100vh - 176px - 110px); overflow:auto; padding:8px; border-radius:12px;
     background:#141416e6; backdrop-filter:blur(14px); border:1px solid #ffffff1a; font-size:13px; }
   #pts[hidden] { display:none; }
@@ -49,6 +58,11 @@
   #pts .pt.sel { background:#5aa9ff33; }
   #pts .pt b { width:22px; height:22px; line-height:22px; text-align:center; border-radius:50%; background:#ffb84d; color:#111; font-size:12px; flex:none; }
   #pts .pt.first b { background:#5ee08a; } #pts .pt.last b { background:#ff6b9a; }
+  /* visitor chapters: grey dots, lit only for the chapter you are in */
+  body:not(.author) #pts .pt b, body.previewing #pts .pt b { background:var(--dim); }
+  body:not(.author) #pts .pt.now b, body.previewing #pts .pt.now b { background:var(--accent); }
+  body:not(.author) .ch i, body.previewing .ch i { background:var(--dim); }
+  body:not(.author) .ch.now i, body.previewing .ch.now i { background:var(--accent); }
   #pts .pt .nm { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; color:var(--fg); }
   #pts .pt .nm.dflt { color:var(--dim); }
   #pts .nmIn { flex:1; min-width:0; font:inherit; color:var(--fg); background:#0008; border:1px solid #ffffff40; border-radius:6px; padding:2px 6px; outline:none; }
@@ -64,9 +78,9 @@
   #slider { flex:1; accent-color:var(--fg); min-width:60px; }
 
   #editBtn { position:fixed; right:20px; top:96px; background:#141416cc; backdrop-filter:blur(14px); }
-  body:not(.author) #ptsBtn { top:56px; }
+  body:not(.author) #ptsRow { top:56px; }
   body:not(.author) #pts { top:96px; }
-  body.previewing #ptsBtn { top:96px; }
+  body.previewing #ptsRow { top:96px; }
   body.previewing #pts { top:136px; }
   body.chapters #marks { display:block; }
   body.chapters:not(.author) #track { height:50px; }
@@ -99,10 +113,14 @@
 </style>
 </head>
 <body data-mode="free">
+  <div id="veil"></div>
   <div id="title"></div>
   <button id="paceBtn" hidden title="Spread the points over a set time with comfortable speed and turns">⏱ Auto-pace</button>
   <button id="prevBtn" hidden title="See what visitors will see">👁 Preview</button>
-  <button id="ptsBtn" hidden title="List of points (L)">☰ Points</button>
+  <div id="ptsRow">
+    <button id="modeBtn">Explore freely</button>
+    <button id="ptsBtn" hidden title="List of points (L)">☰ Points</button>
+  </div>
   <div id="pts" hidden></div>
   <button id="editBtn" hidden title="Edit the path (M)">✎ Edit path</button>
   <div id="hint">
@@ -114,8 +132,7 @@
     <button id="playBtn" title="Play / pause">▶</button>
     <div id="track"><div id="marks"></div><input id="slider" type="range" min="0" max="1000" value="0" aria-label="Position along the tour"></div>
     <span id="clock"></span>
-    <button id="resetBtn" title="Back to the start (R)">↺ Reset</button>
-    <button id="modeBtn">Explore freely</button>
+    <button id="resetBtn" title="Back to the start (R)">↺ Restart</button>
   </div>
 
   <div id="author" hidden>
