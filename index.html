@@ -41,7 +41,7 @@
   body.author #clock { display:block; }
   #playBtn, #modeBtn, #clock { margin-bottom:0; }
   #playBtn, #modeBtn { align-self:flex-end; margin-bottom:2px; }
-  #ptsRow { position:fixed; right:20px; top:136px; display:flex; gap:8px; }
+  #ptsRow { position:fixed; right:20px; top:18px; display:flex; gap:8px; }
   #ptsRow button { background:#141416d9; backdrop-filter:blur(14px); height:36px; box-sizing:border-box; padding-top:0; padding-bottom:0; border-color:#ffffff1f; }
   body:not(.has-path) #modeBtn { display:none; }
   #ui { transition:opacity .45s ease, transform .3s ease, visibility .45s; }
@@ -49,7 +49,7 @@
   @keyframes fadeIn { from { opacity:0 } to { opacity:1 } }
   .tour-hint, .free-hint, #ptsRow button { animation:fadeIn .45s ease; }
   @media (prefers-reduced-motion:reduce) { #ui, .tour-hint, .free-hint, #pts, #ptsRow button { transition:none !important; animation:none; } }
-  #pts { position:fixed; right:20px; top:176px; width:230px; max-height:calc(100vh - 176px - 110px); overflow:auto; padding:8px; border-radius:12px;
+  #pts { position:fixed; right:20px; top:62px; width:230px; max-height:calc(100vh - 62px - 110px); overflow:auto; padding:8px; border-radius:12px;
     background:#141416e6; backdrop-filter:blur(14px); border:1px solid #ffffff1a; font-size:13px; }
   /* Chapters panel eases in and out (display is animated too, so hiding waits for the fade) */
   #pts { transition:opacity .4s cubic-bezier(.22,.61,.36,1), transform .4s cubic-bezier(.22,.61,.36,1), display .4s allow-discrete, overlay .4s allow-discrete; transform-origin:top right; }
@@ -80,11 +80,8 @@
   #playBtn { width:38px; padding:6px 0; }
   #slider { flex:1; accent-color:var(--fg); min-width:60px; }
 
-  #editBtn { position:fixed; right:20px; top:96px; background:#141416cc; backdrop-filter:blur(14px); }
   body:not(.author) #ptsRow { top:18px; }
   body:not(.author) #pts { top:62px; }
-  body.previewing #ptsRow { top:96px; }
-  body.previewing #pts { top:136px; }
   body.chapters #marks { display:block; }
   body.chapters:not(.author) #track { height:50px; }
   .ch { position:absolute; top:14px; transform:translateX(-50%); pointer-events:auto; cursor:pointer; padding:4px 6px; }
@@ -93,9 +90,9 @@
     border-radius:6px; font-size:12px; white-space:nowrap; opacity:0; pointer-events:none; transition:.15s; }
   .ch:hover span { opacity:1; }
   .ch:hover i { transform:scale(1.3); background:var(--accent); }
-  #prevBtn { position:fixed; right:20px; top:56px; background:#141416cc; backdrop-filter:blur(14px); }
-  #paceBtn { position:fixed; right:122px; top:56px; background:#141416cc; backdrop-filter:blur(14px); }
-  body.previewing #paceBtn { display:none; }
+  body.previewing #paceBtn, body.previewing #editBtn, body.previewing #eraseBtn { display:none; }
+  body:not(.editing):not(.erasing) #paceBtn, body:not(.editing):not(.erasing) #eraseBtn { display:none; }
+  body.author #hint { max-width:min(420px, max(180px, calc(100vw - 800px))); }
   #prevBtn.on { background:var(--accent); color:#111; }
   #ptsBtn.on, #editBtn.on { background:var(--accent); color:#111; }
   body.editing canvas { cursor:crosshair; }
@@ -142,7 +139,33 @@
     body:not(.author) #ptsRow { top:calc(52px + env(safe-area-inset-top)); }
     body:not(.author) #pts { top:calc(92px + env(safe-area-inset-top)); }
   }
-  #flash { position:fixed; left:50%; top:20px; transform:translate(-50%,-8px); background:#141416ee; padding:8px 16px;
+  /* author helpers: live coordinates, and a small window showing how the selected point will look in the tour */
+  #coords { position:fixed; left:20px; bottom:96px; z-index:2; padding:7px 11px; border-radius:9px; background:#141416d9; border:1px solid #ffffff1f;
+    color:#f3efe8; font:12px/1.5 ui-monospace,Consolas,monospace; font-variant-numeric:tabular-nums; pointer-events:none; white-space:pre; }
+  #coords i { font-style:normal; color:var(--dim); }
+  #erasePanel { position:fixed; right:20px; bottom:96px; z-index:2; width:300px; padding:10px 12px; border-radius:10px; background:#141416e6; border:1px solid #ffffff22; color:#f3efe8; font-size:12px; line-height:1.45; }
+  #erasePanel[hidden] { display:none; }
+  #erasePanel .eHead { display:flex; justify-content:space-between; margin-bottom:4px; } #erasePanel b { color:#ff7a7a; }
+  #erasePanel .eRow { margin-top:6px; color:#d8d3ca; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  #erasePanel input[type=range] { width:130px; vertical-align:middle; }
+  #erasePanel button { background:#ffffff1c; color:#f3efe8; border:1px solid #ffffff2a; border-radius:6px; padding:4px 9px; cursor:pointer; font-size:12px; }
+  #erasePanel button:hover { background:#ffffff30; }
+  #eraseBtn.on { background:#ff6b6b; color:#111; }
+  body.erasing canvas { cursor:crosshair; }
+  /* with the Erase panel open at the bottom right, keep the Points list and the camera preview clear of it */
+  body.erasing #pts { max-height:calc(100vh - 62px - 96px - 200px); }
+  body.erasing #pip, body.erasing #pipChip { bottom:310px; }
+  #pip { position:fixed; right:20px; bottom:96px; width:440px; height:248px; z-index:2; border:1px solid #ffffff55; border-radius:8px;
+    box-shadow:0 6px 24px #0008; overflow:hidden; }
+  #pip[hidden], #pipChip[hidden] { display:none; }
+  #pip .pipLabel { position:absolute; right:0; top:0; display:flex; align-items:center; gap:8px; padding:3px 4px 3px 10px; background:#141416d9; color:#f3efe8; font-size:11px; letter-spacing:.03em; border-bottom-left-radius:8px; }
+  #pip .pipLabel button { all:unset; cursor:pointer; width:20px; height:18px; line-height:16px; text-align:center; border-radius:5px; font-size:14px; }
+  #pip .pipLabel button:hover { background:#ffffff26; }
+  #pip .pipGrip { position:absolute; left:0; top:0; width:22px; height:22px; cursor:nwse-resize; touch-action:none;
+    background:linear-gradient(135deg, #ffffffcc 0 2px, transparent 2px 5px, #ffffffcc 5px 7px, transparent 7px 10px, #ffffffcc 10px 12px, transparent 12px); border-top-left-radius:8px; opacity:.75; }
+  #pip .pipGrip:hover { opacity:1; }
+  #pipChip { position:fixed; right:20px; bottom:96px; z-index:2; height:32px; padding:0 12px; border-radius:8px; background:#141416d9; backdrop-filter:blur(14px); color:#f3efe8; border:1px solid #ffffff2a; font-size:12px; cursor:pointer; }
+  #flash { position:fixed; left:50%; top:74px; transform:translate(-50%,-8px); background:#141416ee; padding:8px 16px;
     border-radius:999px; border:1px solid #ffffff1f; opacity:0; transition:.25s; pointer-events:none; }
   #flash.show { opacity:1; transform:translate(-50%,0); }
 </style>
@@ -150,14 +173,15 @@
 <body data-mode="free">
   <div id="veil"></div>
   <div id="title"></div>
-  <button id="paceBtn" hidden title="Spread the points over a set time with comfortable speed and turns">⏱ Auto-pace</button>
-  <button id="prevBtn" hidden title="See what visitors will see">👁 Preview</button>
   <div id="ptsRow">
-    <button id="modeBtn" title="Switch between tour and free roam (T)">Explore freely (T)</button>
+    <button id="paceBtn" hidden title="Spread the points over a set time with comfortable speed and turns">⏱ Auto-pace</button>
+    <button id="eraseBtn" hidden title="Click stray splats to mark them for removal (K)">✂ Erase</button>
+    <button id="editBtn" hidden title="Edit the path (M)">✎ Edit path</button>
+    <button id="prevBtn" hidden title="See what visitors will see">👁 Preview</button>
+    <button id="modeBtn" title="Switch between tour and free roam (T)">Explore freely</button>
     <button id="ptsBtn" hidden title="List of points (L)">☰ Points</button>
   </div>
   <div id="pts" hidden></div>
-  <button id="editBtn" hidden title="Edit the path (M)">✎ Edit path</button>
   <div id="hint">
     <span class="tour-hint">Scroll or swipe to move. Drag to look around.</span>
     <span class="tour-hint-touch">Use the timeline to move. Drag to look around.</span>
@@ -178,6 +202,7 @@
     <div class="row"><span><kbd>⇧P</kbd> play preview</span><span><kbd>T</kbd> fly / preview</span></div>
     <div class="row"><span><kbd>O</kbd> fix orientation</span><span><kbd>X</kbd> save path.json</span></div>
     <div class="row"><span><kbd>R</kbd> reset to start</span><span><kbd>G</kbd> ground lock</span></div>
+    <div class="row"><span><kbd>K</kbd> erase stray splats</span><span><kbd>`</kbd> hide / show this panel</span></div>
     <div class="sep"></div>
     <div class="row"><span>Edit path (<kbd>M</kbd>): drag a point to move it</span><span><kbd>⇧</kbd> keeps height</span></div>
     <div class="row"><span>Double-click the line</span><span>adds a point</span></div>
@@ -190,6 +215,16 @@
   <div id="pad"><div id="stick"></div></div>
   <div id="vert"><button id="upBtn">Up</button><button id="dnBtn">Down</button></div>
 
+  <div id="coords" hidden></div>
+  <div id="erasePanel" hidden>
+    <div class="eHead"><b>Erase splats</b><span id="eraseCount">0 marked</span></div>
+    <div class="eRow">Click a stray splat. It disappears right away so you can see the result. Nothing is saved until you press Save.</div>
+    <div class="eRow"><label>Ball size <input type="range" id="eraseR" min="0.05" max="1.5" step="0.05" value="0.3"></label><span id="eraseRv">0.30 m</span></div>
+    <div class="eRow"><button id="eraseUndo" title="Ctrl+Z or Backspace">Undo</button><button id="eraseRedo" title="Ctrl+Y or Ctrl+Shift+Z">Redo</button><button id="eraseClear">Clear all</button><button id="eraseSave">Save now</button><button id="eraseDone">Save & done (K)</button></div>
+    <div class="eRow" id="eraseMsg"></div>
+  </div>
+  <div id="pip" hidden><div class="pipLabel"><span class="pipTitle"></span><button id="pipHide" title="Hide preview" aria-label="Hide preview">–</button></div><div class="pipGrip" title="Drag to resize"></div></div>
+  <button id="pipChip" hidden title="Show the camera preview">▣ Show preview</button>
   <div id="flash"></div>
 
   <div id="loader"><div id="pct">0%</div><div class="track"><div id="bar"></div></div></div>

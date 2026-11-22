@@ -1,5 +1,5 @@
 import * as THREE from "three";
-import { SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
+import { SparkRenderer, SplatMesh, SplatEdit, SplatEditSdf, SplatEditSdfType, SplatEditRgbaBlendMode } from "@sparkjsdev/spark";
 
 /* ------------------------------------------------------------------ *
  *  Setup
@@ -1407,11 +1407,24 @@ window.addEventListener("keydown", (e) => {
     e.preventDefault();
     return clipboardOp(k, e.shiftKey);
   }
+  if (AUTHOR && !preview && eraseOn && ((e.ctrlKey || e.metaKey) && (k === "z" || k === "y") || k === "backspace")) {
+    // eraser is open: undo / redo applies to the erased spots
+    e.preventDefault();
+    return eraseStep(k === "y" || (k === "z" && e.shiftKey) ? 1 : -1);
+  }
   if (AUTHOR && !preview && (e.ctrlKey || e.metaKey) && (k === "z" || k === "y")) {
     e.preventDefault();
     return stepHistory(k === "y" || e.shiftKey ? 1 : -1);
   }
   if (k === "r" && !e.ctrlKey && !e.metaKey) return resetView();
+  if (AUTHOR && !preview && (e.key === "`" || e.code === "Backquote") && !e.ctrlKey && !e.metaKey) {
+    // ` shows / hides the author help panel
+    e.preventDefault();
+    helpHidden = !helpHidden;
+    try { localStorage.setItem("china26-help-hidden", helpHidden ? "1" : "0"); } catch {}
+    return updateHud();
+  }
+  if (AUTHOR && !preview && k === "k" && !e.ctrlKey && !e.metaKey && !e.altKey) return setErase(!eraseOn);
   if (k === "t" && !e.ctrlKey && !e.metaKey && !e.altKey && !e.repeat) {
     // T flips between the guided tour and free roam (needs a path to tour along)
     if (mode === "tour") return setMode("free");
@@ -1741,7 +1754,7 @@ function updateHud() {
   const n = pathData.waypoints.length;
   document.body.classList.toggle("has-path", !!curve);
   if (!AUTHOR) return;
-  $("author").hidden = preview;
+  $("author").hidden = preview || helpHidden;
   $("count").textContent = n + (n === 1 ? " point" : " points");
   $("modeLabel").textContent = mode === "tour" ? "previewing" : "free fly";
 }
@@ -1839,7 +1852,182 @@ function frame(now) {
   if (AUTHOR && !preview) {
     renderer.clearDepth();
     renderer.render(overlay, camera);
+    updateAuthorAids();
+  } else if (AUTHOR) {
+    // visitor preview: none of the author aids (coordinates, camera preview window and its Show button)
+    $("coords").hidden = true;
+    $("pip").hidden = true;
+    $("pipChip").hidden = true;
+    if (eraseOn) setErase(false);
   }
+}
+
+/* Author aids: live coordinates, and a window showing the selected point as the tour will actually show it. */
+const pipCam = new THREE.PerspectiveCamera(camera.fov, 16 / 9, 0.01, 1000);
+const _pipP = new THREE.Vector3(), _pipQ = new THREE.Quaternion(), _pipE = new THREE.Euler(0, 0, 0, "YXZ");
+/* ---- Erase tool: click a stray splat, mark a ball around it, saved to erase.json for cleanup ---- */
+const eraseList = []; // { p:[x,y,z] (world), r }
+let eraseOn = false;
+let eraseDirty = false;
+let eraseEdit = null; // one SplatEdit on the splat mesh; each mark is a transparent ball inside it (live preview of the removal)
+function drawErase() {
+  if (!eraseEdit) {
+    eraseEdit = new SplatEdit({ rgbaBlendMode: SplatEditRgbaBlendMode.MULTIPLY, softEdge: 0, sdfSmooth: 0 });
+    mesh.add(eraseEdit);
+  }
+  for (const c of [...eraseEdit.children]) eraseEdit.remove(c);
+  for (const e of eraseList) {
+    const sdf = new SplatEditSdf({ type: SplatEditSdfType.SPHERE, color: new THREE.Color(1, 1, 1), opacity: 0, radius: e.r });
+    sdf.position.copy(mesh.worldToLocal(new THREE.Vector3().fromArray(e.p)));
+    eraseEdit.add(sdf);
+  }
+  eraseDirty = true;
+  $("eraseCount").textContent = eraseList.length + " erased";
+  $("eraseMsg").textContent = eraseList.length ? "Not saved yet. Press Save & done when you are finished." : "";
+}
+const eraseRay = new THREE.Raycaster();
+// undo / redo for the eraser: snapshots of the list (while erase mode is on, Ctrl+Z / Ctrl+Y / Backspace act here, not on the path)
+const eraseUndoStack = [], eraseRedoStack = [];
+function eraseStep(dir) {
+  if (dir < 0) {
+    if (!eraseUndoStack.length && !eraseList.length) return hudFlash("Nothing to undo");
+    eraseRedoStack.push(eraseList.map((x) => ({ ...x })));
+    const prev = eraseUndoStack.length ? eraseUndoStack.pop() : eraseList.slice(0, -1).map((x) => ({ ...x }));
+    eraseList.length = 0; eraseList.push(...prev);
+  } else {
+    if (!eraseRedoStack.length) return hudFlash("Nothing to redo");
+    eraseUndoStack.push(eraseList.map((x) => ({ ...x })));
+    const next = eraseRedoStack.pop();
+    eraseList.length = 0; eraseList.push(...next);
+  }
+  drawErase();
+}
+async function saveErase() {
+  const body = JSON.stringify({ note: "world coordinates; splat file x,y,z = world x,-z,y", spheres: eraseList });
+  try {
+    const r = await fetch("/__erase", { method: "POST", headers: { "Content-Type": "application/json" }, body });
+    if (!r.ok) throw new Error(r.status);
+    eraseDirty = false;
+    $("eraseMsg").textContent = "Saved to erase.json (" + eraseList.length + " marks). Tell Claude: apply the erase list.";
+  } catch {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([body], { type: "application/json" }));
+    a.download = "erase.json";
+    a.click();
+    $("eraseMsg").textContent = "Server can't save: downloaded erase.json instead. Restart start-author.bat to enable auto-save.";
+  }
+}
+function setErase(on) {
+  const wasOn = eraseOn;
+  eraseOn = on;
+  if (wasOn && !on && eraseDirty && eraseList.length) saveErase(); // one save, when you finish
+  document.body.classList.toggle("erasing", on);
+  $("eraseBtn").classList.toggle("on", on);
+  $("erasePanel").hidden = !on;
+  if (on && editing) setEditing(false);
+  if (on) $("eraseMsg").textContent = "";
+}
+if (AUTHOR) {
+  $("eraseBtn").hidden = false;
+  $("eraseBtn").addEventListener("click", () => setErase(!eraseOn));
+  $("eraseDone").addEventListener("click", () => setErase(false));
+  $("eraseSave").addEventListener("click", () => saveErase());
+  $("eraseR").addEventListener("input", (e) => {
+    const r = Number(e.target.value);
+    $("eraseRv").textContent = r.toFixed(2) + " m";
+    if (eraseList.length) { eraseList[eraseList.length - 1].r = r; drawErase(); }
+  });
+  $("eraseUndo").addEventListener("click", () => eraseStep(-1));
+  $("eraseRedo").addEventListener("click", () => eraseStep(1));
+  $("eraseClear").addEventListener("click", () => { eraseUndoStack.push(eraseList.map((x) => ({ ...x }))); eraseList.length = 0; eraseRedoStack.length = 0; drawErase(); });
+  let down = null;
+  canvas.addEventListener("pointerdown", (e) => { down = e.button === 0 ? [e.clientX, e.clientY] : null; });
+  window.addEventListener("pointerup", (e) => {
+    if (!eraseOn || preview || !down || e.target !== canvas) return;
+    if (Math.hypot(e.clientX - down[0], e.clientY - down[1]) > 5) return;
+    down = null;
+    $("eraseMsg").textContent = "Picking...";
+    setTimeout(() => {
+      eraseRay.setFromCamera(new THREE.Vector2((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1), camera);
+      const hit = eraseRay.intersectObject(mesh, false)[0];
+      if (!hit) { $("eraseMsg").textContent = "Nothing under the cursor. Try clicking right on the splat."; return; }
+      eraseUndoStack.push(eraseList.map((x) => ({ ...x })));
+      eraseRedoStack.length = 0;
+      eraseList.push({ p: hit.point.toArray().map((v) => +v.toFixed(3)), r: Number($("eraseR").value) });
+      drawErase();
+    }, 20);
+  });
+}
+let helpHidden = false;
+try { helpHidden = localStorage.getItem("china26-help-hidden") === "1"; } catch {}
+let aidTick = 0;
+// size and hidden state of the camera preview window are remembered in this browser
+let pipPrefs = { w: 440, hidden: false };
+try { Object.assign(pipPrefs, JSON.parse(localStorage.getItem("china26-pip") || "{}")); } catch {}
+const pipMaxW = () => Math.max(240, Math.min(960, window.innerWidth * 0.62));
+function applyPipSize() {
+  const w = Math.max(240, Math.min(pipMaxW(), pipPrefs.w));
+  $("pip").style.width = w + "px";
+  $("pip").style.height = Math.round((w * 9) / 16) + "px";
+}
+function savePip() { try { localStorage.setItem("china26-pip", JSON.stringify(pipPrefs)); } catch {} }
+if (AUTHOR) {
+  applyPipSize();
+  $("pipHide").addEventListener("click", () => { pipPrefs.hidden = true; savePip(); });
+  $("pipChip").addEventListener("click", () => { pipPrefs.hidden = false; savePip(); });
+  window.addEventListener("resize", applyPipSize);
+  const grip = document.querySelector("#pip .pipGrip");
+  grip.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    grip.setPointerCapture(e.pointerId);
+    const x0 = e.clientX, w0 = $("pip").getBoundingClientRect().width;
+    const move = (ev) => { pipPrefs.w = Math.max(240, Math.min(pipMaxW(), w0 + (x0 - ev.clientX))); applyPipSize(); };
+    const up = () => { grip.removeEventListener("pointermove", move); grip.removeEventListener("pointerup", up); savePip(); };
+    grip.addEventListener("pointermove", move);
+    grip.addEventListener("pointerup", up);
+  });
+}
+function updateAuthorAids() {
+  const box = $("coords"), pip = $("pip");
+  // coordinates (every few frames is plenty)
+  if (box.hidden) box.hidden = false;
+  if (++aidTick % 4 === 0) {
+    const p = camera.position;
+    _pipE.setFromQuaternion(camera.quaternion, "YXZ");
+    const f = (v) => (v < 0 ? "" : " ") + v.toFixed(2);
+    box.innerHTML = "<i>world </i>x" + f(p.x) + "  y" + f(p.y) + "  z" + f(p.z) + "\n<i>splat </i>x" + f(p.x) + "  y" + f(-p.z) + "  z" + f(p.y) +
+      "\n<i>look  </i>yaw " + THREE.MathUtils.radToDeg(_pipE.y).toFixed(0) + "°  pitch " + THREE.MathUtils.radToDeg(_pipE.x).toFixed(0) + "°";
+  }
+  // preview of the selected point
+  const show = curve && mode === "free" && selected >= 0 && wpT[selected] != null;
+  const open = show && !pipPrefs.hidden;
+  if (pip.hidden === open) pip.hidden = !open;
+  const chip = $("pipChip");
+  const wantChip = show && pipPrefs.hidden;
+  if (chip.hidden === wantChip) chip.hidden = !wantChip;
+  if (!open) return;
+  const r = pip.getBoundingClientRect();
+  samplePathT(wpT[selected], _pipP, _pipQ);
+  pipCam.position.copy(_pipP);
+  pipCam.quaternion.copy(_pipQ);
+  pipCam.fov = camera.fov;
+  pipCam.aspect = r.width / r.height;
+  pipCam.updateProjectionMatrix();
+  pipCam.updateMatrixWorld(true);
+  pip.querySelector(".pipTitle").textContent = "Point " + (selected + 1) + " · how the tour sees it";
+  const full = renderer.getSize(new THREE.Vector2());
+  const vx = r.left, vy = full.y - r.bottom;
+  renderer.setScissorTest(true);
+  renderer.setScissor(vx, vy, r.width, r.height);
+  renderer.setViewport(vx, vy, r.width, r.height);
+  renderer.clear();
+  const au = spark.autoUpdate;
+  spark.autoUpdate = false; // keep the splat ordering for the main view; do not re-sort for the little window
+  renderer.render(scene, pipCam);
+  spark.autoUpdate = au;
+  renderer.setScissorTest(false);
+  renderer.setViewport(0, 0, full.x, full.y);
 }
 
 /* ------------------------------------------------------------------ *
@@ -1872,6 +2060,7 @@ if (!AUTHOR) {
   }
 }
 if (AUTHOR) {
+  $("coords").hidden = false;
   document.body.classList.add("author");
   const pb = $("ptsBtn");
   pb.hidden = false;

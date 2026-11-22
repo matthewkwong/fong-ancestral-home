@@ -15,6 +15,16 @@ const types = {
 
 http.createServer((req, res) => {
   const url = new URL(req.url, "http://x");
+  // author tool: the Erase panel posts its list of marked spots here; saved as erase.json next to this file
+  if (req.method === "POST" && url.pathname === "/__erase") {
+    let body = "";
+    req.on("data", (c) => { body += c; if (body.length > 1e6) req.destroy(); });
+    req.on("end", () => {
+      try { JSON.parse(body); fs.writeFileSync(path.join(root, "erase.json"), body); res.writeHead(200).end("ok"); }
+      catch { res.writeHead(400).end("bad json"); }
+    });
+    return;
+  }
   let file = path.join(root, decodeURIComponent(url.pathname));
   if (!file.startsWith(root)) { res.writeHead(403).end(); return; }
   if (fs.existsSync(file) && fs.statSync(file).isDirectory()) file = path.join(file, "index.html");
