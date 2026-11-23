@@ -140,10 +140,10 @@
     body:not(.author) #pts { top:calc(92px + env(safe-area-inset-top)); }
   }
   /* author helpers: live coordinates, and a small window showing how the selected point will look in the tour */
-  #coords { position:fixed; left:20px; bottom:96px; z-index:2; padding:7px 11px; border-radius:9px; background:#141416d9; border:1px solid #ffffff1f;
+  #coords { position:fixed; left:20px; bottom:calc(96px + var(--gh)); z-index:2; padding:7px 11px; border-radius:9px; background:#141416d9; border:1px solid #ffffff1f;
     color:#f3efe8; font:12px/1.5 ui-monospace,Consolas,monospace; font-variant-numeric:tabular-nums; pointer-events:none; white-space:pre; }
   #coords i { font-style:normal; color:var(--dim); }
-  #erasePanel { position:fixed; right:20px; bottom:96px; z-index:2; width:300px; padding:10px 12px; border-radius:10px; background:#141416e6; border:1px solid #ffffff22; color:#f3efe8; font-size:12px; line-height:1.45; }
+  #erasePanel { position:fixed; right:20px; bottom:calc(96px + var(--gh)); z-index:2; width:300px; padding:10px 12px; border-radius:10px; background:#141416e6; border:1px solid #ffffff22; color:#f3efe8; font-size:12px; line-height:1.45; }
   #erasePanel[hidden] { display:none; }
   #erasePanel .eHead { display:flex; justify-content:space-between; margin-bottom:4px; } #erasePanel b { color:#ff7a7a; }
   #erasePanel .eRow { margin-top:6px; color:#d8d3ca; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
@@ -154,20 +154,47 @@
   body.erasing canvas { cursor:crosshair; }
   /* with the Erase panel open at the bottom right, keep the Points list and the camera preview clear of it */
   body.erasing #pts { max-height:calc(100vh - 62px - 96px - 200px); }
-  body.erasing #pip, body.erasing #pipChip { bottom:310px; }
-  #pip { position:fixed; right:20px; bottom:96px; width:440px; height:248px; z-index:2; border:1px solid #ffffff55; border-radius:8px;
+  body.erasing #pip, body.erasing #pipChip { bottom:calc(310px + var(--gh)); }
+  #pip { position:fixed; right:20px; bottom:calc(96px + var(--gh)); width:440px; height:248px; z-index:2; border:1px solid #ffffff55; border-radius:8px;
     box-shadow:0 6px 24px #0008; overflow:hidden; }
   #pip[hidden], #pipChip[hidden] { display:none; }
-  #pip .pipLabel { position:absolute; right:0; top:0; display:flex; align-items:center; gap:8px; padding:3px 4px 3px 10px; background:#141416d9; color:#f3efe8; font-size:11px; letter-spacing:.03em; border-bottom-left-radius:8px; }
+  #pip .pipLabel { position:absolute; right:0; top:0; display:flex; align-items:center; gap:8px; padding:3px 4px 3px 10px; background:#141416d9; color:#f3efe8; font-size:11px; letter-spacing:.03em; border-bottom-left-radius:8px; cursor:grab; touch-action:none; user-select:none; }
+  body.pipMoving, body.pipMoving * { cursor:grabbing !important; }
   #pip .pipLabel button { all:unset; cursor:pointer; width:20px; height:18px; line-height:16px; text-align:center; border-radius:5px; font-size:14px; }
   #pip .pipLabel button:hover { background:#ffffff26; }
   #pip .pipGrip { position:absolute; left:0; top:0; width:22px; height:22px; cursor:nwse-resize; touch-action:none;
     background:linear-gradient(135deg, #ffffffcc 0 2px, transparent 2px 5px, #ffffffcc 5px 7px, transparent 7px 10px, #ffffffcc 10px 12px, transparent 12px); border-top-left-radius:8px; opacity:.75; }
   #pip .pipGrip:hover { opacity:1; }
-  #pipChip { position:fixed; right:20px; bottom:96px; z-index:2; height:32px; padding:0 12px; border-radius:8px; background:#141416d9; backdrop-filter:blur(14px); color:#f3efe8; border:1px solid #ffffff2a; font-size:12px; cursor:pointer; }
+  #pipChip { position:fixed; right:20px; bottom:calc(96px + var(--gh)); z-index:2; height:32px; padding:0 12px; border-radius:8px; background:#141416d9; backdrop-filter:blur(14px); color:#f3efe8; border:1px solid #ffffff2a; font-size:12px; cursor:pointer; }
   #flash { position:fixed; left:50%; top:74px; transform:translate(-50%,-8px); background:#141416ee; padding:8px 16px;
     border-radius:999px; border:1px solid #ffffff1f; opacity:0; transition:.25s; pointer-events:none; }
   #flash.show { opacity:1; transform:translate(-50%,0); }
+  #pacePanel { position:fixed; right:20px; top:62px; z-index:3; width:220px; padding:12px; border-radius:10px; background:#141416f2; border:1px solid #ffffff22; color:#f3efe8; font-size:12px; backdrop-filter:blur(14px); }
+  #pacePanel[hidden] { display:none; }
+  #pacePanel .pRow { display:flex; gap:6px; align-items:center; margin-top:8px; }
+  #pacePanel input { width:54px; height:30px; border-radius:6px; border:1px solid #ffffff2a; background:#0e0e10; color:#f3efe8; font-size:14px; padding:0 8px; }
+  #pacePanel button { flex:1; height:30px; border-radius:6px; border:1px solid #ffffff2a; background:#ffffff14; color:#f3efe8; cursor:pointer; }
+  #pacePanel #paceGo { background:var(--accent); color:#111; border-color:transparent; }
+  #paceBtn.on { background:var(--accent); color:#111; }
+  :root { --gh:0px; --gph:300px; }
+  body.speedon.editing { --gh:calc(var(--gph) + 12px); }
+  #speedGrip { position:absolute; left:0; right:0; top:-5px; height:10px; cursor:ns-resize; z-index:4; display:flex; justify-content:center; align-items:center; }
+  #speedGrip::after { content:""; width:44px; height:4px; border-radius:2px; background:#ffffff40; }
+  #speedGrip:hover::after { background:#ffffff90; }
+  #speedPanel { position:absolute; left:0; right:0; bottom:calc(100% + 12px); height:var(--gph); z-index:3; border-radius:10px; background:#141416f2; border:1px solid #ffffff22; color:#f3efe8; font-size:12px; backdrop-filter:blur(14px); display:flex; flex-direction:column; }
+  #speedPanel[hidden], body:not(.editing) #speedPanel { display:none; }
+  #speedPanel .spHead { display:flex; align-items:center; gap:12px; padding:7px 10px 0; }
+  #speedPanel .spHead b { color:#ffb454; font-weight:600; }
+  #speedPanel .spHead span { color:#d8d3ca; font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #speedPanel .spHelp { flex:1; opacity:.7; min-width:0; }
+  #speedPanel button { all:unset; cursor:pointer; padding:3px 8px; border-radius:6px; background:#ffffff1c; border:1px solid #ffffff2a; font-size:11px; }
+  #speedPanel button:hover { background:#ffffff30; }
+  #speedPanel .spTabs { display:flex; gap:4px; }
+  #speedPanel .spTabs button.on { background:var(--accent); color:#111; border-color:transparent; }
+  #speedPanel [hidden] { display:none; }
+  #speedPanel #speedCv { position:relative; inset:auto; flex:1 1 0; width:100%; height:auto; min-height:0; display:block; touch-action:none; cursor:default; }
+  body.erasing #speedBtn, body:not(.editing):not(.erasing) #speedBtn { display:none; }
+  #speedBtn.on { background:var(--accent); color:#111; }
 </style>
 </head>
 <body data-mode="free">
@@ -175,6 +202,7 @@
   <div id="title"></div>
   <div id="ptsRow">
     <button id="paceBtn" hidden title="Spread the points over a set time with comfortable speed and turns">⏱ Auto-pace</button>
+    <button id="speedBtn" hidden title="Graphs of speed, look direction and height along the path">📈 Graphs</button>
     <button id="eraseBtn" hidden title="Click stray splats to mark them for removal (K)">✂ Erase</button>
     <button id="editBtn" hidden title="Edit the path (M)">✎ Edit path</button>
     <button id="prevBtn" hidden title="See what visitors will see">👁 Preview</button>
@@ -191,7 +219,7 @@
 
   <div id="ui">
     <button id="playBtn" title="Play / pause">▶</button>
-    <div id="track"><div id="marks"></div><input id="slider" type="range" min="0" max="1000" value="0" aria-label="Position along the tour"></div>
+    <div id="track"><div id="speedPanel" hidden><div class="spHead"><div class="spTabs"><button id="gtSpeed" class="on">Speed</button><button id="gtLook">Look</button><button id="gtHeight">Height</button></div><span id="speedTotal"></span><span class="spHelp" id="speedHelp">dots: up / down = speed, sideways = move in time, double-click = type a value, F9 = easy ease (select several, hold Alt / ⌘ to spread them out) · click one to show its handles · handles: sideways = influence, up / down = speed, Alt / ⌘ = one side · drag the curve between points to speed up / slow down that stretch · double-click to reset · drag empty space to select several points (Shift = add)</span><button id="speedReset" title="Put every point speed and handle back to automatic">Reset all</button><button id="speedX" title="Close">✕</button></div><canvas id="speedCv"></canvas></div><div id="marks"></div><input id="slider" type="range" min="0" max="1000" value="0" aria-label="Position along the tour"></div>
     <span id="clock"></span>
     <button id="resetBtn" title="Restart (R)" aria-label="Restart"><span class="ic">↺</span><span class="lbl"> Restart</span></button>
   </div>
@@ -202,6 +230,7 @@
     <div class="row"><span><kbd>⇧P</kbd> play preview</span><span><kbd>T</kbd> fly / preview</span></div>
     <div class="row"><span><kbd>O</kbd> fix orientation</span><span><kbd>X</kbd> save path.json</span></div>
     <div class="row"><span><kbd>R</kbd> reset to start</span><span><kbd>G</kbd> ground lock</span></div>
+    <div class="row"><span><kbd>Alt</kbd> / <kbd>⌘</kbd> + drag a curve handle: one side only</span><span></span></div>
     <div class="row"><span><kbd>K</kbd> erase stray splats</span><span><kbd>`</kbd> hide / show this panel</span></div>
     <div class="sep"></div>
     <div class="row"><span>Edit path (<kbd>M</kbd>): drag a point to move it</span><span><kbd>⇧</kbd> keeps height</span></div>

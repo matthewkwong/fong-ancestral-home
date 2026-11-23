@@ -321,10 +321,10 @@ let curve = null;
 let wpU = []; // arc-length parameter of each waypoint (where it sits on the route)
 let wpT = []; // timeline position of each waypoint, 0..1 (auto = wpU, or a custom w.t you dragged)
 // timeline position -> position along the route (piecewise between waypoints, so each point lands on its own time)
-let wpM = []; // slopes for the smooth timeline mapping
+let wpM = [], wpMI = [], wpIO = [], wpII = [], segB = []; // per point: speed leaving / arriving (route fraction per timeline fraction), influence leaving / arriving; per stretch: bezier control points
 function buildTimeMap() {
   const n = wpT.length;
-  wpM = [];
+  wpM = []; wpMI = []; wpIO = []; wpII = []; segB = [];
   if (n < 2) return;
   const d = [];
   for (let i = 0; i < n - 1; i++) d.push((wpU[i + 1] - wpU[i]) / Math.max(wpT[i + 1] - wpT[i], 1e-6));
@@ -337,18 +337,43 @@ function buildTimeMap() {
     const a = wpM[i] / d[i], b = wpM[i + 1] / d[i], s = a * a + b * b;
     if (s > 9) { const k = 3 / Math.sqrt(s); wpM[i] = k * a * d[i]; wpM[i + 1] = k * b * d[i]; }
   }
+  wpMI = wpM.slice();
+  // what you set in the speed graph (like After Effects keyframes): v = speed at the point in m/s (vb: arriving side only),
+  // io / ii = influence, how far along the neighbouring stretch the ease reaches (1/3 = the automatic smooth curve)
+  const wps = pathData.waypoints, lenM = curve ? curve.getLength() : 0, durS = Math.max(pathData.duration, 1);
+  wps.forEach((w, i) => {
+    if (i >= n) return;
+    if (lenM > 0) {
+      if (w.v != null) wpM[i] = wpMI[i] = (w.v * durS) / lenM;
+      if (w.vb != null) wpMI[i] = (w.vb * durS) / lenM;
+    }
+    wpIO[i] = clamp(w.io ?? 1 / 3, 0.02, 0.95);
+    wpII[i] = clamp(w.ii ?? 1 / 3, 0.02, 0.95);
+  });
+  for (let j = 0; j < n - 1; j++) {
+    const x0 = wpT[j], x3 = wpT[j + 1], h = x3 - x0, u0 = wpU[j], u3 = wpU[j + 1];
+    let io = wpIO[j], ii = wpII[j + 1];
+    if (io + ii > 0.98) { const k = 0.98 / (io + ii); io *= k; ii *= k; }
+    const u1 = clamp(u0 + wpM[j] * io * h, u0, u3), u2 = clamp(u3 - wpMI[j + 1] * ii * h, u1, u3); // never runs backwards
+    segB.push([x0, x0 + io * h, x3 - ii * h, x3, u0, u1, u2, u3, io, ii]);
+  }
 }
-// timeline position -> position along the route. Monotone cubic, so the speed changes smoothly at points instead of jumping.
+const bez3 = (a, b, c, d, t) => { const m = 1 - t; return m * m * m * a + 3 * m * m * t * b + 3 * m * t * t * c + t * t * t * d; };
+// timeline position -> position along the route: a cubic bezier between neighbouring points whose handles are the speed and
+// influence at each point, exactly like keyframe handles in After Effects' speed graph.
 function tlToU(x) {
   const n = wpT.length;
-  if (n < 2) return x;
+  if (n < 2 || !segB.length) return x;
   x = clamp(x, 0, 1);
   let j = 0;
   while (j < n - 2 && x > wpT[j + 1]) j++;
-  const h = Math.max(wpT[j + 1] - wpT[j], 1e-6);
-  const t = clamp((x - wpT[j]) / h, 0, 1), t2 = t * t, t3 = t2 * t;
-  const u = (2 * t3 - 3 * t2 + 1) * wpU[j] + (t3 - 2 * t2 + t) * h * wpM[j] + (-2 * t3 + 3 * t2) * wpU[j + 1] + (t3 - t2) * h * wpM[j + 1];
-  return clamp(u, 0, 1);
+  const b = segB[j];
+  let lo = 0, hi = 1;
+  for (let k = 0; k < 26; k++) {
+    const mid = (lo + hi) / 2;
+    if (bez3(b[0], b[1], b[2], b[3], mid) < x) lo = mid; else hi = mid;
+  }
+  return clamp(bez3(b[4], b[5], b[6], b[7], (lo + hi) / 2), 0, 1);
 }
 const T_GAP = 0.004;
 let pathLine = null;
@@ -356,6 +381,7 @@ const overlay = new THREE.Scene(); // drawn after the splats, always on top
 const markers = new THREE.Group();
 overlay.add(markers);
 
+let speedOn = false, speedDirty = true, speedLast = -1, speedDrag = null, speedHover = null, speedYMax = 0, gSel = new Set(); // gSel: points picked together in the graph
 let editing = false; // author: point-editing mode (drag points, add on line)
 function setEditing(on) {
   editing = !!on;
@@ -365,7 +391,8 @@ function setEditing(on) {
     b.classList.toggle("on", editing);
   }
   document.body.classList.toggle("editing", editing);
-  if (!editing) selectPoint(-1);
+  if (editing && AUTHOR && !preview && mode === "tour") setMode("free", false, true); // points can only be moved while flying freely
+  if (!editing) { selectPoint(-1); gSel.clear(); }
   hudFlash(editing ? "Edit mode · drag points to move them · double-click the line to add one" : "Edit mode off");
 }
 let selected = -1; // index of the selected waypoint (author mode)
@@ -562,6 +589,8 @@ function renderChapters() {
       // Dip to black, jump while the screen is dark, then fade back in: a cut would feel abrupt. (The Chapters list stays open.)
       const veil = $("veil");
       clearTimeout(go.t);
+      playing = false; // picking a chapter pauses the tour at that spot
+      $("playBtn").textContent = "▶";
       if (!veil || matchMedia("(prefers-reduced-motion: reduce)").matches) return snapTour(u);
       veil.style.transitionDuration = "0.22s";
       veil.style.opacity = "1";
@@ -758,7 +787,8 @@ function handleVecs(wps) {
       const v = new THREE.Vector3(...w.h);
       const dl = i > 0 ? pts[i].distanceTo(pts[i - 1]) : Infinity, dr = i < pts.length - 1 ? pts[i].distanceTo(pts[i + 1]) : Infinity;
       out.push(v.clone().clampLength(0, 0.6 * dr));
-      inn.push(v.clone().clampLength(0, 0.6 * dl));
+      // w.hb: a separate arriving handle, set when one side was dragged on its own (Alt / Cmd + drag)
+      inn.push((w.hb ? new THREE.Vector3(...w.hb) : v.clone()).clampLength(0, 0.6 * dl));
     } else {
       const a = autoHandles(i, pts);
       out.push(a.out);
@@ -928,6 +958,7 @@ function rebuildPath() {
   }
   updateHud();
   renderTimeline();
+  speedDirty = true;
 }
 
 const _q0 = new THREE.Quaternion();
@@ -959,133 +990,72 @@ function buildRotations(wps) {
   });
 }
 const _qa = new THREE.Quaternion(), _qb = new THREE.Quaternion();
-// Both the camera position and the view direction are laid out over the timeline and then low-pass filtered, so neither can
-// snap: sharp corners and sudden turns are rounded off into steady, gradual motion. Filtering forward and then backward
-// means no lag; the ends are held so the first and last views stay as authored.
-let rotTrack = null, posTrack = null, rotM = 0;
-const ROT_HZ = 30, ROT_TAU = 0.9, POS_TAU = 1.2; // samples per second; smoothing time (seconds) for view / position
-function buildTracks() {
-  const n = pathData.waypoints.length;
-  rotTrack = posTrack = null;
-  if (n < 2 || !curve) return;
-  const dur = Math.max(pathData.duration, 2);
-  const M = Math.max(8, Math.ceil(dur * ROT_HZ) + 1);
-  const qs = [], ps = [];
-  let j = 0;
-  for (let k = 0; k < M; k++) {
-    const x = k / (M - 1);
-    while (j < n - 2 && x > wpT[j + 1]) j++;
-    const f = clamp((x - wpT[j]) / Math.max(wpT[j + 1] - wpT[j], 1e-6), 0, 1);
-    const q = rotQ[j].clone().slerp(rotQ[j + 1], f);
-    if (k > 0 && q.dot(qs[k - 1]) < 0) q.set(-q.x, -q.y, -q.z, -q.w);
-    qs.push(q);
-    ps.push(curve.getPointAt(clamp(tlToU(x), 0, 1), new THREE.Vector3()));
+// The camera follows the route and the headings you authored exactly, with no filtering. Filtering rounds corners off by letting
+// the camera drift past or lag behind a point, which is what shows up as sway. Position comes straight from the route and the speed
+// graph. Heading and tilt are each one smooth curve through your points that is monotone: between two points it only ever goes
+// one way, so it can never overshoot and swing back, and it eases to a stop wherever the view holds or the turn changes direction.
+let rotSpline = null, posTrack = null, posM = 0;
+// Position: the route can have tight corners where you bent it hard. A gentle filter (run forward and then backward, so it adds no
+// lag and cannot overshoot) rounds only those corners off. It is deliberately light, and nothing is added back afterwards.
+const POS_HZ = 30, POS_TAU = 0.7;
+function pchip(xs, ys) {
+  const n = xs.length, h = [], d = [];
+  for (let i = 0; i < n - 1; i++) { h.push(Math.max(xs[i + 1] - xs[i], 1e-9)); d.push((ys[i + 1] - ys[i]) / h[i]); }
+  const m = new Array(n).fill(0); // the first and last views start and finish at rest
+  for (let i = 1; i < n - 1; i++) {
+    if (d[i - 1] * d[i] <= 0) continue;
+    const w1 = 2 * h[i] + h[i - 1], w2 = h[i] + 2 * h[i - 1];
+    m[i] = (w1 + w2) / (w1 / d[i - 1] + w2 / d[i]); // weighted harmonic mean: never steeper than either side, so no overshoot
   }
-  const pad = Math.ceil(ROT_HZ * 3 * Math.max(ROT_TAU, POS_TAU));
-  const ext = (arr) => [...Array(pad).fill(arr[0]), ...arr, ...Array(pad).fill(arr[arr.length - 1])].map((v) => v.clone());
-  const aR = 1 - Math.exp(-1 / ROT_HZ / ROT_TAU), aP = 1 - Math.exp(-1 / ROT_HZ / POS_TAU);
-  const Q = ext(qs), P = ext(ps), L = Q.length;
-  for (let round = 0; round < 2; round++) {
-    for (let k = 1; k < L; k++) { Q[k] = Q[k - 1].clone().slerp(Q[k], aR); P[k] = P[k - 1].clone().lerp(P[k], aP); }
-    for (let k = L - 2; k >= 0; k--) { Q[k] = Q[k + 1].clone().slerp(Q[k], aR); P[k] = P[k + 1].clone().lerp(P[k], aP); }
-  }
-  rotTrack = Q.slice(pad, pad + M);
-  posTrack = P.slice(pad, pad + M);
-  rotM = M;
-  // Smoothing spreads the turns on either side of a point into the stretch between them. Where two neighbouring points
-  // have (almost) the same view, hold that view through the middle of the stretch and only ease in and out at its ends.
-  for (let i = 0; i < n - 1; i++) {
-    if (rotQ[i].angleTo(rotQ[i + 1]) > 0.07) continue; // more than about 4 degrees apart: a real turn
-    const s0 = clamp(wpT[i], 0, 1) * (M - 1), s1 = clamp(wpT[i + 1], 0, 1) * (M - 1);
-    const ramp = Math.min(ROT_HZ * 2.0, (s1 - s0) / 2);
-    if (ramp < 1) continue;
-    for (let k = Math.ceil(s0); k <= Math.floor(s1); k++) {
-      const x = Math.min(k - s0, s1 - k) / ramp;
-      const w = x >= 1 ? 1 : x * x * (3 - 2 * x);
-      const tgt = qs[k].clone();
-      if (tgt.dot(rotTrack[k]) < 0) tgt.set(-tgt.x, -tgt.y, -tgt.z, -tgt.w);
-      rotTrack[k] = rotTrack[k].clone().slerp(tgt, w);
-    }
-  }
-  // Filtering rounds corners off, which can pull the camera off a point. Measure how far off it is at each point's time and
-  // blend that error back in with a smooth curve, so the camera still passes exactly through every point.
-  const idx = pathData.waypoints.map((_, i) => clamp(wpT[i], 0, 1) * (M - 1));
-  const err = idx.map((s, i) => {
-    const a = Math.min(Math.floor(s), M - 2), f = s - a;
-    return new THREE.Vector3(...pathData.waypoints[i].p).sub(posTrack[a].clone().lerp(posTrack[a + 1], f));
-  });
-  const tang = err.map((e, i) => {
-    const a = Math.max(i - 1, 0), b = Math.min(i + 1, n - 1);
-    const dt = Math.max(idx[b] - idx[a], 1e-6);
-    return err[b].clone().sub(err[a]).divideScalar(dt);
-  });
-  let seg = 0;
-  for (let k = 0; k < M; k++) {
-    while (seg < n - 2 && k > idx[seg + 1]) seg++;
-    const h = Math.max(idx[seg + 1] - idx[seg], 1e-6);
-    const t = clamp((k - idx[seg]) / h, 0, 1), t2 = t * t, t3 = t2 * t;
-    const c = err[seg].clone().multiplyScalar(2 * t3 - 3 * t2 + 1)
-      .addScaledVector(tang[seg], (t3 - 2 * t2 + t) * h)
-      .addScaledVector(err[seg + 1], -2 * t3 + 3 * t2)
-      .addScaledVector(tang[seg + 1], (t3 - t2) * h);
-    posTrack[k].add(c);
-  }
-  // Same idea for the view direction: measure how far the smoothed look is from each point's own look at its time, and blend
-  // that difference back in smoothly, so the view at every point matches what the editor shows.
-  const rerr = pathData.waypoints.map((w, i) => {
-    const s = idx[i], a = Math.min(Math.floor(s), M - 2), f = s - a;
-    const cur = rotTrack[a].clone();
-    const nx = rotTrack[a + 1].clone();
-    if (nx.dot(cur) < 0) nx.set(-nx.x, -nx.y, -nx.z, -nx.w);
-    cur.slerp(nx, f);
-    const tgt = new THREE.Quaternion(...w.q);
-    const d = tgt.multiply(cur.invert()); // tgt * cur^-1
-    if (d.w < 0) d.set(-d.x, -d.y, -d.z, -d.w);
-    const ang = 2 * Math.acos(clamp(d.w, -1, 1)), sn = Math.sqrt(Math.max(1 - d.w * d.w, 0));
-    return sn < 1e-6 ? new THREE.Vector3() : new THREE.Vector3(d.x, d.y, d.z).multiplyScalar(ang / sn);
-  });
-  // Apply each point's correction only near that point (a smooth bump that never reaches the next point), so fixing the
-  // view at a point cannot drag the stretch between two points off its own view.
-  const cq = new THREE.Quaternion(), axis = new THREE.Vector3(), cv = new THREE.Vector3();
-  const reach = idx.map((s, i) => {
-    const prev = i > 0 ? s - idx[i - 1] : Infinity, next = i < n - 1 ? idx[i + 1] - s : Infinity;
-    return Math.max(1, Math.min(ROT_HZ * 2.5, prev / 2, next / 2, 1e9));
-  });
-  for (let k = 0; k < M; k++) {
-    cv.set(0, 0, 0);
-    for (let i = 0; i < n; i++) {
-      const x = Math.abs(k - idx[i]) / reach[i];
-      if (x >= 1) continue;
-      cv.addScaledVector(rerr[i], 1 - x * x * (3 - 2 * x));
-    }
-    const ang = cv.length();
-    if (ang > 1e-9) { axis.copy(cv).divideScalar(ang); cq.setFromAxisAngle(axis, ang); rotTrack[k] = cq.clone().multiply(rotTrack[k]); }
-  }
-  // The camera only ever turns left/right and up/down. Blending big turns can leave a little sideways tilt (roll) in the
-  // in-between frames, so rebuild every frame from its heading and pitch with the horizon kept level.
-  const fwd = new THREE.Vector3(), eu = new THREE.Euler(0, 0, 0, "YXZ");
-  for (let k = 0; k < M; k++) {
-    fwd.set(0, 0, -1).applyQuaternion(rotTrack[k]);
-    if (Math.abs(fwd.y) > 0.998) continue; // looking straight up or down: heading is undefined, leave as is
-    eu.set(Math.asin(clamp(fwd.y, -1, 1)), Math.atan2(-fwd.x, -fwd.z), 0, "YXZ");
-    const lv = new THREE.Quaternion().setFromEuler(eu);
-    if (lv.dot(rotTrack[k]) < 0) lv.set(-lv.x, -lv.y, -lv.z, -lv.w);
-    rotTrack[k] = lv;
-  }
+  return { xs, ys, m, h };
 }
+function pchipAt(sp, x) {
+  const n = sp.xs.length;
+  let j = 0;
+  while (j < n - 2 && x > sp.xs[j + 1]) j++;
+  const h = sp.h[j], t = clamp((x - sp.xs[j]) / h, 0, 1), t2 = t * t, t3 = t2 * t;
+  return (2 * t3 - 3 * t2 + 1) * sp.ys[j] + (t3 - 2 * t2 + t) * h * sp.m[j] + (-2 * t3 + 3 * t2) * sp.ys[j + 1] + (t3 - t2) * h * sp.m[j + 1];
+}
+function buildTracks() {
+  rotSpline = null;
+  posTrack = null;
+  const n = pathData.waypoints.length;
+  if (n < 2 || !curve) return;
+  const fwd = new THREE.Vector3(), yaw = [], pit = [];
+  for (let i = 0; i < n; i++) {
+    fwd.set(0, 0, -1).applyQuaternion(rotQ[i]);
+    pit.push(Math.asin(clamp(fwd.y, -1, 1)));
+    let y = Math.abs(fwd.y) > 0.998 && i > 0 ? yaw[i - 1] : Math.atan2(-fwd.x, -fwd.z); // looking straight up or down: keep the heading
+    if (i > 0) y += 2 * Math.PI * Math.round((yaw[i - 1] - y) / (2 * Math.PI)); // each turn the short way round
+    yaw.push(y);
+  }
+  rotSpline = { yaw: pchip(wpT, yaw), pit: pchip(wpT, pit) };
+  const dur = Math.max(pathData.duration, 2), M = Math.max(8, Math.ceil(dur * POS_HZ) + 1);
+  const ps = [];
+  for (let k = 0; k < M; k++) ps.push(curve.getPointAt(clamp(tlToU(k / (M - 1)), 0, 1), new THREE.Vector3()));
+  const pad = Math.ceil(POS_HZ * 4 * POS_TAU), a = 1 - Math.exp(-1 / POS_HZ / POS_TAU);
+  const P = [...Array(pad).fill(ps[0]), ...ps, ...Array(pad).fill(ps[M - 1])].map((v) => v.clone());
+  for (let r = 0; r < 2; r++) {
+    for (let k = 1; k < P.length; k++) P[k].lerpVectors(P[k - 1], P[k], a);
+    for (let k = P.length - 2; k >= 0; k--) P[k].lerpVectors(P[k + 1], P[k], a);
+  }
+  posTrack = P.slice(pad, pad + M);
+  posM = M;
+}
+const _camEuler = new THREE.Euler(0, 0, 0, "YXZ");
 // pose at timeline position tau (0..1)
 function samplePathT(tau, outPos, outQuat) {
-  if (!rotTrack) {
-    curve.getPointAt(clamp(tlToU(tau), 0, 1), outPos);
-    return;
-  }
-  const s = clamp(tau, 0, 1) * (rotM - 1);
-  const i = Math.min(Math.floor(s), rotM - 2), f = s - i;
-  outPos.copy(posTrack[i]).lerp(posTrack[i + 1], f);
-  outQuat.copy(rotTrack[i]);
-  if (rotTrack[i + 1].dot(outQuat) < 0) outQuat.set(-outQuat.x, -outQuat.y, -outQuat.z, -outQuat.w);
-  outQuat.slerp(rotTrack[i + 1], f);
+  tau = clamp(tau, 0, 1);
+  if (posTrack) {
+    const sp = tau * (posM - 1), i = Math.min(Math.floor(sp), posM - 2);
+    outPos.copy(posTrack[i]).lerp(posTrack[i + 1], sp - i);
+  } else curve.getPointAt(clamp(tlToU(tau), 0, 1), outPos);
+  if (!rotSpline) return;
+  _camEuler.set(pchipAt(rotSpline.pit, tau), pchipAt(rotSpline.yaw, tau), 0, "YXZ");
+  outQuat.setFromEuler(_camEuler);
 }
+// debugging helper (author mode): the camera pose the tour really uses at a time, as x y z + yaw pitch roll in degrees
+if (AUTHOR) window.__cam = (sec) => { const p = new THREE.Vector3(), q = new THREE.Quaternion(), e = new THREE.Euler(); samplePathT(sec / Math.max(pathData.duration, 1), p, q); e.setFromQuaternion(q, "YXZ"); return [p.x, p.y, p.z, e.y * R2D, e.x * R2D, e.z * R2D]; };
 function samplePath(u, outPos, outQuat) {
   const wps = pathData.waypoints;
   u = clamp(u, 0, 1);
@@ -1128,7 +1098,7 @@ function nearestTourU(pos) {
   scan(Math.max(0, best - 0.003), Math.min(1, best + 0.003), 60);
   return best;
 }
-function setMode(m, immediate) {
+function setMode(m, immediate, keepPlayhead) {
   if (m === "tour" && !curve) return;
   if (mode === "free" && m === "tour" && !AUTHOR && !immediate) {
     // Visitors: pick the tour up from the spot nearest to where they are, hidden behind a quick dip to black.
@@ -1151,7 +1121,7 @@ function setMode(m, immediate) {
   }
   if (mode === "free" && m === "tour") {
     // keep the playhead where it was, so going back to the tour resumes instead of restarting; with a point selected it starts at that point
-    if (AUTHOR && selected >= 0 && wpT[selected] != null) snapTour(wpT[selected]); // start right at the selected point
+    if (AUTHOR && !keepPlayhead && selected >= 0 && wpT[selected] != null) snapTour(wpT[selected]); // start right at the selected point
     else tourU = tourTarget;
     lookYaw = lookPitch = 0;
   }
@@ -1228,6 +1198,16 @@ canvas.addEventListener("pointerdown", (e) => {
     const th = pickTangent(e);
     if (th) {
       drag.tan = th;
+      drag.tan.solo = e.altKey || e.metaKey; // Alt (Option) or Cmd: bend only this side of the point
+      if (drag.tan.solo) {
+        const wq = pathData.waypoints[th.i];
+        if (!wq.h || !wq.hb) {
+          const hv = handleVecs(pathData.waypoints);
+          if (!wq.h) wq.h = hv.hs[th.i].toArray().map((x) => +x.toFixed(5));
+          if (!wq.hb) wq.hb = hv.hi[th.i].toArray().map((x) => +x.toFixed(5));
+        }
+        hudFlash("One side only · the other side stays put");
+      }
       tangentEnds(th.i, _te);
       const tp = _te[th.side];
       drag.plane = new THREE.Plane().setFromNormalAndCoplanarPoint(e.shiftKey ? new THREE.Vector3(0, 1, 0) : camera.getWorldDirection(new THREE.Vector3()), tp);
@@ -1276,7 +1256,14 @@ canvas.addEventListener("pointermove", (e) => {
       const w = pathData.waypoints[drag.tan.i];
       const v = hit.sub(new THREE.Vector3(...w.p));
       if (drag.tan.side === "back") v.negate();
-      w.h = v.toArray().map((x) => +x.toFixed(5));
+      const va = v.toArray().map((x) => +x.toFixed(5));
+      if (drag.tan.solo) {
+        if (drag.tan.side === "back") w.hb = va;
+        else w.h = va;
+      } else {
+        w.h = va;
+        delete w.hb;
+      }
       rebuildPath();
     }
     return;
@@ -1355,6 +1342,7 @@ canvas.addEventListener("dblclick", (e) => {
   const th = pickTangent(e);
   if (th) {
     delete pathData.waypoints[th.i].h;
+    delete pathData.waypoints[th.i].hb;
     save();
     rebuildPath();
     return hudFlash("Curve handle reset");
@@ -1431,6 +1419,8 @@ window.addEventListener("keydown", (e) => {
     if (curve) return setMode("tour");
     return;
   }
+  // editor: flying keys during a preview take over the camera from where it is
+  if (AUTHOR && !preview && mode === "tour" && ["w", "a", "s", "d", "q", "e"].includes(k) && !e.ctrlKey && !e.metaKey && !e.altKey) setMode("free");
   if (mode === "free") {
     if (["w", "a", "s", "d", "q", "e", "shift"].includes(k)) keys.add(k);
   }
@@ -1439,7 +1429,7 @@ window.addEventListener("keydown", (e) => {
     // Space while the pointer is over the playbar = play / pause (instead of dropping a point)
     if (k === " " && overBar && curve) {
       e.preventDefault();
-      if (mode !== "tour") setMode("tour");
+      if (mode !== "tour") setMode("tour", false, true);
       togglePlay();
       return;
     }
@@ -1589,12 +1579,14 @@ function togglePlay() {
   if (!playing && tourTarget >= 0.999) tourU = tourTarget = 0;
   playing = !playing;
   $("playBtn").textContent = playing ? "❚❚" : "▶";
+  // editor: pausing hands the camera back to you, right where the preview stopped, so you can keep flying and editing
+  if (AUTHOR && !preview && !playing && mode === "tour") setMode("free");
 }
 let overBar = false;
 $("ui").addEventListener("pointerenter", () => (overBar = true));
 $("ui").addEventListener("pointerleave", () => (overBar = false));
 $("playBtn").addEventListener("click", () => {
-  if (mode !== "tour") setMode("tour");
+  if (mode !== "tour") setMode("tour", false, true);
   togglePlay();
 });
 $("modeBtn").addEventListener("click", () => {
@@ -1723,6 +1715,11 @@ function cycleOrientation() {
     const out = { p: p.toArray(), q: q.toArray() };
     if (w.t != null) out.t = w.t;
     if (w.h) out.h = new THREE.Vector3(...w.h).applyQuaternion(delta).toArray();
+    if (w.hb) out.hb = new THREE.Vector3(...w.hb).applyQuaternion(delta).toArray();
+    if (w.v != null) out.v = w.v;
+    if (w.vb != null) out.vb = w.vb;
+    if (w.io != null) out.io = w.io;
+    if (w.ii != null) out.ii = w.ii;
     return out;
   });
   save();
@@ -1812,9 +1809,10 @@ function frame(now) {
       if (tourTarget >= 1) {
         playing = false;
         $("playBtn").textContent = "▶";
+        if (AUTHOR && !preview) setMode("free"); // editor: at the end of the preview you are free to fly again
       }
     }
-    tourU += (tourTarget - tourU) * (1 - Math.exp(-dt * 4));
+    tourU += (tourTarget - tourU) * (1 - Math.exp(-dt * (playing && !glide ? 40 : 4))); // while playing, follow the timeline closely: lag is what makes a camera feel like it sways
     samplePathT(tourU, _p, _pq);
     camera.position.copy(_p);
     if (drag) lastLook = now;
@@ -1826,7 +1824,7 @@ function frame(now) {
     }
     _off.setFromEuler(euler.set(lookPitch, lookYaw, 0, "YXZ"));
     _tq.copy(_pq).multiply(_off);
-    camera.quaternion.slerp(_tq, 1 - Math.exp(-dt * 6));
+    camera.quaternion.slerp(_tq, 1 - Math.exp(-dt * (playing && !glide ? 40 : 6)));
     if (chapterEls.length) updateNow(tourU);
     const over = tourTarget >= 0.999 && tourU >= 0.99;
     if (over !== tourOver) { tourOver = over; document.body.classList.toggle("ended", over); } // phones show Restart only once the tour is over
@@ -1853,6 +1851,7 @@ function frame(now) {
     renderer.clearDepth();
     renderer.render(overlay, camera);
     updateAuthorAids();
+    if (speedOn && (speedDirty || speedLast !== tourTarget)) drawSpeed();
   } else if (AUTHOR) {
     // visitor preview: none of the author aids (coordinates, camera preview window and its Show button)
     $("coords").hidden = true;
@@ -1917,6 +1916,7 @@ async function saveErase() {
     $("eraseMsg").textContent = "Server can't save: downloaded erase.json instead. Restart start-author.bat to enable auto-save.";
   }
 }
+let editBeforeErase = false;
 function setErase(on) {
   const wasOn = eraseOn;
   eraseOn = on;
@@ -1924,7 +1924,8 @@ function setErase(on) {
   document.body.classList.toggle("erasing", on);
   $("eraseBtn").classList.toggle("on", on);
   $("erasePanel").hidden = !on;
-  if (on && editing) setEditing(false);
+  if (on && editing) { editBeforeErase = true; setEditing(false); }
+  if (!on && wasOn && editBeforeErase) { editBeforeErase = false; if (!preview) setEditing(true); } // back to editing, so Erase and Auto-pace stay put
   if (on) $("eraseMsg").textContent = "";
 }
 if (AUTHOR) {
@@ -1962,13 +1963,24 @@ let helpHidden = false;
 try { helpHidden = localStorage.getItem("china26-help-hidden") === "1"; } catch {}
 let aidTick = 0;
 // size and hidden state of the camera preview window are remembered in this browser
-let pipPrefs = { w: 440, hidden: false };
+let pipPrefs = { w: 440, hidden: false, x: null, y: null };
 try { Object.assign(pipPrefs, JSON.parse(localStorage.getItem("china26-pip") || "{}")); } catch {}
 const pipMaxW = () => Math.max(240, Math.min(960, window.innerWidth * 0.62));
 function applyPipSize() {
   const w = Math.max(240, Math.min(pipMaxW(), pipPrefs.w));
-  $("pip").style.width = w + "px";
-  $("pip").style.height = Math.round((w * 9) / 16) + "px";
+  const h = Math.round((w * 9) / 16), el = $("pip");
+  el.style.width = w + "px";
+  el.style.height = h + "px";
+  if (pipPrefs.x != null && pipPrefs.y != null) {
+    // moved by hand: pinned by its top-left corner, kept on screen
+    pipPrefs.x = Math.max(0, Math.min(window.innerWidth - w, pipPrefs.x));
+    pipPrefs.y = Math.max(0, Math.min(window.innerHeight - h, pipPrefs.y));
+    el.style.left = pipPrefs.x + "px";
+    el.style.top = pipPrefs.y + "px";
+    el.style.right = el.style.bottom = "auto";
+  } else {
+    el.style.left = el.style.top = el.style.right = el.style.bottom = "";
+  }
 }
 function savePip() { try { localStorage.setItem("china26-pip", JSON.stringify(pipPrefs)); } catch {} }
 if (AUTHOR) {
@@ -1976,13 +1988,38 @@ if (AUTHOR) {
   $("pipHide").addEventListener("click", () => { pipPrefs.hidden = true; savePip(); });
   $("pipChip").addEventListener("click", () => { pipPrefs.hidden = false; savePip(); });
   window.addEventListener("resize", applyPipSize);
+  // drag the label bar to move the preview anywhere; double-click it to send it back to the corner
+  const lab = document.querySelector("#pip .pipLabel");
+  lab.title = "Drag to move · double-click to put it back";
+  lab.addEventListener("pointerdown", (e) => {
+    if (e.target.closest("button")) return;
+    e.preventDefault();
+    e.stopPropagation();
+    try { lab.setPointerCapture(e.pointerId); } catch {}
+    const r0 = $("pip").getBoundingClientRect(), dx = e.clientX - r0.left, dy = e.clientY - r0.top;
+    document.body.classList.add("pipMoving");
+    const move = (ev) => { pipPrefs.x = ev.clientX - dx; pipPrefs.y = ev.clientY - dy; applyPipSize(); };
+    const up = () => { lab.removeEventListener("pointermove", move); lab.removeEventListener("pointerup", up); lab.removeEventListener("pointercancel", up); document.body.classList.remove("pipMoving"); savePip(); };
+    lab.addEventListener("pointermove", move);
+    lab.addEventListener("pointerup", up);
+    lab.addEventListener("pointercancel", up);
+  });
+  lab.addEventListener("dblclick", (e) => { if (e.target.closest("button")) return; pipPrefs.x = pipPrefs.y = null; applyPipSize(); savePip(); });
   const grip = document.querySelector("#pip .pipGrip");
   grip.addEventListener("pointerdown", (e) => {
     e.preventDefault();
     e.stopPropagation();
-    grip.setPointerCapture(e.pointerId);
-    const x0 = e.clientX, w0 = $("pip").getBoundingClientRect().width;
-    const move = (ev) => { pipPrefs.w = Math.max(240, Math.min(pipMaxW(), w0 + (x0 - ev.clientX))); applyPipSize(); };
+    try { grip.setPointerCapture(e.pointerId); } catch {}
+    const r0 = $("pip").getBoundingClientRect(), x0 = e.clientX, w0 = r0.width;
+    const move = (ev) => {
+      pipPrefs.w = Math.max(240, Math.min(pipMaxW(), w0 + (x0 - ev.clientX)));
+      if (pipPrefs.x != null) { // moved by hand: the opposite (bottom-right) corner stays put while the size changes
+        const w1 = Math.max(240, Math.min(pipMaxW(), pipPrefs.w));
+        pipPrefs.x = r0.right - w1;
+        pipPrefs.y = r0.bottom - Math.round((w1 * 9) / 16);
+      }
+      applyPipSize();
+    };
     const up = () => { grip.removeEventListener("pointermove", move); grip.removeEventListener("pointerup", up); savePip(); };
     grip.addEventListener("pointermove", move);
     grip.addEventListener("pointerup", up);
@@ -2036,8 +2073,11 @@ function updateAuthorAids() {
 rebuildPath();
 startPose();
 const defaultStart = { p: camera.position.clone(), q: camera.quaternion.clone() };
-if (curve && !AUTHOR) setMode("tour");
-else setMode("free");
+if (curve && !AUTHOR) {
+  setMode("tour");
+  playing = true; // visitors: the tour starts by itself
+  $("playBtn").textContent = "❚❚";
+} else setMode("free");
 renderer.setAnimationLoop(frame);
 
 $("loader").classList.add("done");
@@ -2076,6 +2116,567 @@ if (AUTHOR) {
   eb.hidden = false;
   eb.addEventListener("click", () => setEditing(!editing));
 }
+
+/* ------------------------------------------------------------------ *
+ *  Speed graph (author): speed against time. Dots sit on the points (drag up / down = how fast the camera is moving as it
+ *  passes, double-click = back to automatic); bars sit between points (drag up / down = how fast that stretch is flown,
+ *  which makes it take less or more time).
+ * ------------------------------------------------------------------ */
+const SP = { l: 8, r: 8, t: 26, b: 22 };
+// Other graphs: how the camera's heading / tilt (Look) and height change over the tour. Dots sit on the points, drag up / down to edit them.
+let gTab = "speed", gLo = 0, gHi = 1;
+const R2D = 180 / Math.PI, _gp = new THREE.Vector3(), _gq = new THREE.Quaternion(), _ge = new THREE.Euler();
+const GHELP = {
+  speed: "dots: drag up / down = speed, sideways = move in time, double-click = type a value, F9 = easy ease (select several, hold Alt / ⌘ to spread them out) · click one to show its handles · handles: sideways = influence, up / down = speed, Alt / ⌘ = one side · drag the curve between points to speed up / slow down that stretch · double-click to reset · drag empty space to select several points (Shift = add)",
+  look: "orange: heading (left / right) · blue: tilt (up / down) · drag a dot up / down to turn the view, sideways to move it in time · drag empty space to select several",
+  height: "drag a dot up / down to raise or lower that point, sideways to move it in time · drag empty space to select several",
+};
+function seriesModel(tab) {
+  const wps = pathData.waypoints, n = wps.length;
+  if (!curve || !rotSpline || n < 2) return null;
+  const N = 240, yawC = [], pitC = [], yC = [];
+  let prev = null;
+  for (let k = 0; k <= N; k++) {
+    samplePathT(k / N, _gp, _gq);
+    _ge.setFromQuaternion(_gq, "YXZ");
+    let yw = _ge.y * R2D;
+    if (prev !== null) { while (yw - prev > 180) yw -= 360; while (yw - prev < -180) yw += 360; }
+    prev = yw;
+    yawC.push(yw); pitC.push(_ge.x * R2D); yC.push(_gp.y);
+  }
+  const idx = (t) => Math.round(clamp(t, 0, 1) * N);
+  const nodes = (fn) => wps.map((w, i) => ({ i, t: wpT[i], v: fn(w, i) }));
+  if (tab === "height") return [{ key: "y", color: "#6ee7a8", unit: " m", dec: 2, curve: yC, nodes: nodes((w) => w.p[1]) }];
+  const eul = (w) => _ge.setFromQuaternion(_gq.set(...w.q), "YXZ");
+  return [
+    { key: "yaw", color: "#ffb454", unit: "°", dec: 0, curve: yawC, nodes: nodes((w, i) => { const b = eul(w).y * R2D; return b + 360 * Math.round((yawC[idx(wpT[i])] - b) / 360); }) },
+    { key: "pitch", color: "#7cc4ff", unit: "°", dec: 0, curve: pitC, nodes: nodes((w) => eul(w).x * R2D) },
+  ];
+}
+function niceStep(span) {
+  const raw = span / 4, p = Math.pow(10, Math.floor(Math.log10(raw))), f = raw / p;
+  return (f < 1.5 ? 1 : f < 3.5 ? 2 : f < 7.5 ? 5 : 10) * p;
+}
+function drawSeries(c, g) {
+  const ser = seriesModel(gTab);
+  if (!ser) { c.fillStyle = "#d8d3ca"; c.font = "12px system-ui"; c.fillText("Add at least 2 points to see this graph", 12, g.H / 2); return; }
+  if (!speedDrag) {
+    let lo = Infinity, hi = -Infinity;
+    ser.forEach((s) => { s.curve.forEach((v) => { lo = Math.min(lo, v); hi = Math.max(hi, v); }); s.nodes.forEach((nd) => { lo = Math.min(lo, nd.v); hi = Math.max(hi, nd.v); }); });
+    const minSpan = gTab === "height" ? 0.6 : 30;
+    if (hi - lo < minSpan) { const mid = (hi + lo) / 2; lo = mid - minSpan / 2; hi = mid + minSpan / 2; }
+    const pad = (hi - lo) * 0.12;
+    gLo = lo - pad; gHi = hi + pad;
+  }
+  const X = (t) => g.x0 + (g.x1 - g.x0) * t, Y = (v) => g.y0 - ((v - gLo) / (gHi - gLo)) * (g.y0 - g.y1);
+  c.font = "10px ui-monospace, Consolas, monospace";
+  const step = niceStep(gHi - gLo);
+  for (let v = Math.ceil(gLo / step) * step; v <= gHi; v += step) {
+    c.strokeStyle = "#ffffff14"; c.lineWidth = 1; c.beginPath(); c.moveTo(g.x0, Y(v) + 0.5); c.lineTo(g.x1, Y(v) + 0.5); c.stroke();
+    c.fillStyle = "#ffffff70"; c.fillText(+v.toFixed(2) + ser[0].unit, g.x0 + 3, Y(v) - 3);
+  }
+  ser[0].nodes.forEach((nd) => { c.strokeStyle = "#ffffff12"; c.beginPath(); c.moveTo(X(nd.t) + 0.5, g.y1); c.lineTo(X(nd.t) + 0.5, g.y0); c.stroke(); });
+  ser.forEach((s) => {
+    c.beginPath();
+    s.curve.forEach((v, k) => { const x = X(k / (s.curve.length - 1)), y = Y(v); k ? c.lineTo(x, y) : c.moveTo(x, y); });
+    c.strokeStyle = s.color; c.lineWidth = 2; c.stroke();
+  });
+  ser.forEach((s) => s.nodes.forEach((nd) => {
+    const hot = (speedHover && speedHover.kind === "snode" && speedHover.key === s.key && speedHover.i === nd.i) || (speedDrag && speedDrag.kind === "snode" && speedDrag.key === s.key && speedDrag.i === nd.i);
+    c.beginPath(); c.arc(X(nd.t), Y(nd.v), hot ? 7 : 5.5, 0, 7);
+    c.fillStyle = nd.i === selected ? "#b388ff" : "#141416"; c.fill();
+    c.lineWidth = 2; c.strokeStyle = s.color; c.stroke();
+    if (gSel.size > 1 && gSel.has(nd.i)) { c.beginPath(); c.arc(X(nd.t), Y(nd.v), 9.5, 0, 7); c.lineWidth = 1.5; c.strokeStyle = "#fff"; c.stroke(); }
+    if (hot) { c.fillStyle = "#fff"; c.fillText(nd.v.toFixed(s.dec) + s.unit, Math.min(X(nd.t) + 10, g.x1 - 50), Y(nd.v) - 10); }
+  }));
+  const ph = X(clamp(tourTarget, 0, 1));
+  c.strokeStyle = "#ff5c8a"; c.lineWidth = 1.5; c.beginPath(); c.moveTo(ph + 0.5, g.y1 - 6); c.lineTo(ph + 0.5, g.y0); c.stroke();
+  drawMarquee(c);
+  speedLast = tourTarget; speedDirty = false;
+  const k = Math.round(clamp(tourTarget, 0, 1) * (ser[0].curve.length - 1));
+  $("speedTotal").textContent = "now: " + ser.map((s) => (ser.length > 1 ? s.key + " " : "") + s.curve[k].toFixed(s.dec) + s.unit).join(" · ");
+}
+function seriesPick(e) {
+  const ser = seriesModel(gTab);
+  if (!ser) return null;
+  const r = $("speedCv").getBoundingClientRect(), px = e.clientX - r.left, py = e.clientY - r.top, g = speedGeom();
+  const X = (t) => g.x0 + (g.x1 - g.x0) * t, Y = (v) => g.y0 - ((v - gLo) / (gHi - gLo)) * (g.y0 - g.y1);
+  let best = null, bd = 12;
+  ser.forEach((s) => s.nodes.forEach((nd) => { const d = Math.hypot(X(nd.t) - px, Y(nd.v) - py); if (d < bd) { bd = d; best = { kind: "snode", key: s.key, i: nd.i }; } }));
+  return best;
+}
+function setGraphTab(t) {
+  gTab = t;
+  [["speed", "gtSpeed"], ["look", "gtLook"], ["height", "gtHeight"]].forEach(([k, id]) => $(id).classList.toggle("on", k === t));
+  $("speedHelp").textContent = GHELP[t];
+  $("speedReset").hidden = t !== "speed";
+  speedHover = null;
+  closeValBox();
+  speedDirty = true;
+  drawSpeed();
+}
+function speedGeom() {
+  const cv = $("speedCv");
+  const W = cv.clientWidth, H = cv.clientHeight;
+  return { W, H, x0: SP.l, x1: W - SP.r, y0: H - SP.b, y1: SP.t };
+}
+function speedModel() {
+  const wps = pathData.waypoints, n = wps.length;
+  if (!curve || n < 2) return null;
+  const len = curve.getLength(), dur = Math.max(pathData.duration, 1);
+  const at = (x) => {
+    const e = 0.0025, a = Math.max(0, x - e), b = Math.min(1, x + e);
+    return ((tlToU(b) - tlToU(a)) / Math.max(b - a, 1e-9)) * (len / dur);
+  };
+  const k = len / dur;
+  // dots and handles show the speed the camera really has there (what the curve does), not the value asked for, so they never float off it
+  const nodes = wpT.map((t, i) => {
+    const hr = i < n - 1 ? wpT[i + 1] - wpT[i] : 0, hl = i > 0 ? wpT[i] - wpT[i - 1] : 0;
+    const bo = i < n - 1 ? segB[i] : null, bi = i > 0 ? segB[i - 1] : null;
+    const so = bo && bo[8] * hr > 1e-9 ? ((bo[5] - bo[4]) / (bo[8] * hr)) * k : null;
+    const si = bi && bi[9] * hl > 1e-9 ? ((bi[7] - bi[6]) / (bi[9] * hl)) * k : null;
+    return { i, t, v: so ?? si ?? 0, vi: si ?? so ?? 0, hr, hl, io: bo ? bo[8] : 0, ii: bi ? bi[9] : 0 };
+  });
+  const segs = [];
+  for (let i = 0; i < n - 1; i++) {
+    const L = (wpU[i + 1] - wpU[i]) * len, T = (wpT[i + 1] - wpT[i]) * dur;
+    segs.push({ i, t0: wpT[i], t1: wpT[i + 1], L, T, v: L / Math.max(T, 1e-6) });
+  }
+  return { len, dur, at, nodes, segs };
+}
+function speedYScale(m) {
+  let mx = 0.5;
+  for (let k = 0; k <= 200; k++) mx = Math.max(mx, m.at(k / 200));
+  m.nodes.forEach((n) => (mx = Math.max(mx, n.v, n.vi)));
+  m.segs.forEach((s) => (mx = Math.max(mx, s.v)));
+  return Math.ceil(mx * 1.2 * 2) / 2;
+}
+// the dots of the current graph in canvas pixels (for the selection box)
+function graphNodeSpots() {
+  const g = speedGeom(), X = (t) => g.x0 + (g.x1 - g.x0) * t, out = [];
+  if (gTab === "speed") {
+    const m = speedModel();
+    if (!m) return out;
+    const Y = (v) => g.y0 - (g.y0 - g.y1) * Math.min(v / speedYMax, 1.02);
+    m.nodes.forEach((n) => out.push({ i: n.i, x: X(n.t), y: Y(n.v) }));
+  } else {
+    const ser = seriesModel(gTab);
+    if (!ser) return out;
+    const Y = (v) => g.y0 - ((v - gLo) / (gHi - gLo)) * (g.y0 - g.y1);
+    ser.forEach((s) => s.nodes.forEach((nd) => out.push({ i: nd.i, x: X(nd.t), y: Y(nd.v) })));
+  }
+  return out;
+}
+// values of every dot as a drag starts, so a group of selected dots moves together by the same amount
+function graphBase(hit) {
+  const base = {};
+  if (hit.kind === "node") speedModel().nodes.forEach((n) => (base[n.i] = n.v));
+  else seriesModel(gTab).find((x) => x.key === hit.key).nodes.forEach((nd) => (base[nd.i] = nd.v));
+  return base;
+}
+function drawMarquee(c) {
+  const d = speedDrag;
+  if (!d || d.kind !== "marquee" || !d.moved) return;
+  const x = Math.min(d.x0, d.x1), y = Math.min(d.y0, d.y1), w = Math.abs(d.x1 - d.x0), h = Math.abs(d.y1 - d.y0);
+  c.fillStyle = "#b388ff22"; c.fillRect(x, y, w, h);
+  c.strokeStyle = "#b388ff"; c.lineWidth = 1; c.setLineDash([4, 3]); c.strokeRect(x + 0.5, y + 0.5, w, h); c.setLineDash([]);
+}
+function drawSpeed() {
+  if (!speedOn || !$("speedPanel") || !document.body.classList.contains("editing")) return;
+  const cv = $("speedCv"), m = gTab === "speed" ? speedModel() : null;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2), g = speedGeom();
+  if (!g.W || !g.H) return;
+  if (cv.width !== Math.round(g.W * dpr) || cv.height !== Math.round(g.H * dpr)) { cv.width = Math.round(g.W * dpr); cv.height = Math.round(g.H * dpr); }
+  const c = cv.getContext("2d");
+  c.setTransform(dpr, 0, 0, dpr, 0, 0);
+  c.clearRect(0, 0, g.W, g.H);
+  if (gTab !== "speed") return drawSeries(c, g);
+  if (!m) { c.fillStyle = "#d8d3ca"; c.font = "12px system-ui"; c.fillText("Add at least 2 points to see speed", 12, g.H / 2); return; }
+  if (!speedDrag) speedYMax = speedYScale(m);
+  const X = (t) => g.x0 + (g.x1 - g.x0) * t, Y = (v) => g.y0 - (g.y0 - g.y1) * Math.min(v / speedYMax, 1.02);
+  c.font = "10px ui-monospace, Consolas, monospace";
+  // grid + labels
+  const step = speedYMax > 4 ? 1 : 0.5;
+  c.lineWidth = 1;
+  for (let v = 0; v <= speedYMax + 1e-6; v += step) {
+    c.strokeStyle = "#ffffff14"; c.beginPath(); c.moveTo(g.x0, Y(v) + 0.5); c.lineTo(g.x1, Y(v) + 0.5); c.stroke();
+    c.fillStyle = "#ffffff70"; c.fillText(v.toFixed(v % 1 ? 1 : 0) + " m/s", g.x0 + 3, Y(v) - 3);
+  }
+  // chapter / point guides
+  m.nodes.forEach((n) => { c.strokeStyle = "#ffffff12"; c.beginPath(); c.moveTo(X(n.t) + 0.5, g.y1); c.lineTo(X(n.t) + 0.5, g.y0); c.stroke(); });
+  // the speed curve itself
+  c.beginPath();
+  for (let k = 0; k <= 240; k++) { const t = k / 240, x = X(t), y = Y(Math.max(m.at(t), 0)); k ? c.lineTo(x, y) : c.moveTo(x, y); }
+  c.strokeStyle = "#ffb454"; c.lineWidth = 2; c.stroke();
+  c.lineTo(X(1), g.y0); c.lineTo(X(0), g.y0); c.closePath(); c.fillStyle = "#ffb45422"; c.fill();
+  // hovering or dragging the curve between two points: that stretch is shaded, with its average speed and time
+  m.segs.forEach((s) => {
+    const hot = (speedHover && speedHover.kind === "seg" && speedHover.i === s.i) || (speedDrag && speedDrag.kind === "seg" && speedDrag.i === s.i);
+    if (!hot) return;
+    c.beginPath();
+    for (let k = 0; k <= 60; k++) { const t = s.t0 + ((s.t1 - s.t0) * k) / 60, x = X(t), y = Y(Math.max(m.at(t), 0)); k ? c.lineTo(x, y) : c.moveTo(x, y); }
+    c.lineTo(X(s.t1), g.y0); c.lineTo(X(s.t0), g.y0); c.closePath(); c.fillStyle = "#ffffff26"; c.fill();
+    c.fillStyle = "#fff"; c.fillText("avg " + s.v.toFixed(2) + " m/s · " + s.T.toFixed(1) + " s", Math.max(g.x0 + 4, Math.min(X((s.t0 + s.t1) / 2) - 50, g.x1 - 120)), g.y1 - 8);
+  });
+  // handles of the selected point (like After Effects): drag sideways = influence, up / down = speed
+  const sn = m.nodes[selected];
+  if (sn) {
+    const hs = [];
+    if (sn.i < m.nodes.length - 1) hs.push({ kind: "hout", x: sn.t + sn.io * sn.hr, v: sn.v });
+    if (sn.i > 0) hs.push({ kind: "hin", x: sn.t - sn.ii * sn.hl, v: sn.vi });
+    hs.forEach((h) => {
+      const hot = (speedHover && speedHover.kind === h.kind) || (speedDrag && speedDrag.kind === h.kind);
+      c.strokeStyle = "#b388ff"; c.lineWidth = 1.5; c.beginPath(); c.moveTo(X(sn.t), Y(sn.v)); c.lineTo(X(h.x), Y(h.v)); c.stroke();
+      c.beginPath(); c.arc(X(h.x), Y(h.v), hot ? 6 : 4.5, 0, 7); c.fillStyle = "#b388ff"; c.fill(); c.lineWidth = 1.5; c.strokeStyle = "#141416"; c.stroke();
+      if (hot) { c.fillStyle = "#fff"; c.fillText(h.v.toFixed(2) + " m/s · " + Math.round((h.kind === "hout" ? sn.io : sn.ii) * 100) + "%", X(h.x) + 9, Y(h.v) - 9); }
+    });
+  }
+  // point dots (speed as the camera passes the point)
+  m.nodes.forEach((n) => {
+    const w = pathData.waypoints[n.i], hot = (speedHover && speedHover.kind === "node" && speedHover.i === n.i) || (speedDrag && speedDrag.kind === "node" && speedDrag.i === n.i);
+    c.beginPath(); c.arc(X(n.t), Y(n.v), hot ? 7 : 5.5, 0, 7);
+    c.fillStyle = w.v != null || w.io != null || w.ii != null ? "#6ee7a8" : n.i === selected ? "#b388ff" : "#141416"; c.fill();
+    c.lineWidth = 2; c.strokeStyle = w.v != null ? "#141416" : "#6ee7a8"; c.stroke();
+    if (gSel.size > 1 && gSel.has(n.i)) { c.beginPath(); c.arc(X(n.t), Y(n.v), 9.5, 0, 7); c.lineWidth = 1.5; c.strokeStyle = "#fff"; c.stroke(); }
+    if (hot) { c.fillStyle = "#fff"; c.fillText(n.v.toFixed(2) + " m/s" + (w.v != null ? "" : " · auto"), Math.min(X(n.t) + 10, g.x1 - 80), Y(n.v) - 10); }
+  });
+  // playhead
+  const ph = X(clamp(tourTarget, 0, 1));
+  c.strokeStyle = "#ff5c8a"; c.lineWidth = 1.5; c.beginPath(); c.moveTo(ph + 0.5, g.y1 - 6); c.lineTo(ph + 0.5, g.y0); c.stroke();
+  drawMarquee(c);
+  speedLast = tourTarget; speedDirty = false;
+  $("speedTotal").textContent = "total " + fmtT(m.dur) + " · length " + m.len.toFixed(1) + " m";
+}
+function speedPick(e) {
+  if (gTab !== "speed") return seriesPick(e);
+  const m = speedModel();
+  if (!m) return null;
+  const r = $("speedCv").getBoundingClientRect(), px = e.clientX - r.left, py = e.clientY - r.top, g = speedGeom();
+  const X = (t) => g.x0 + (g.x1 - g.x0) * t, Y = (v) => g.y0 - (g.y0 - g.y1) * Math.min(v / speedYMax, 1.02);
+  let best = null, bd = 12;
+  const sn = m.nodes[selected];
+  if (sn) {
+    const hs = [];
+    if (sn.i < m.nodes.length - 1) hs.push({ kind: "hout", i: sn.i, x: sn.t + sn.io * sn.hr, v: sn.v });
+    if (sn.i > 0) hs.push({ kind: "hin", i: sn.i, x: sn.t - sn.ii * sn.hl, v: sn.vi });
+    hs.forEach((h) => { const d = Math.hypot(X(h.x) - px, Y(h.v) - py); if (d < bd) { bd = d; best = { kind: h.kind, i: h.i }; } });
+    if (best) return best;
+  }
+  bd = 12;
+  m.nodes.forEach((n) => { const d = Math.hypot(X(n.t) - px, Y(n.v) - py); if (d < bd) { bd = d; best = { kind: "node", i: n.i }; } });
+  if (best) return best;
+  bd = 10;
+  // the curve itself between two points: drag it up / down to speed up or slow down that stretch
+  const xt = (px - g.x0) / (g.x1 - g.x0);
+  m.segs.forEach((s) => {
+    if (xt < s.t0 || xt > s.t1) return;
+    const d = Math.abs(Y(Math.max(m.at(xt), 0)) - py);
+    if (d < bd) { bd = d; best = { kind: "seg", i: s.i }; }
+  });
+  return best;
+}
+function seriesSetFromY(hit, e) {
+  const r = $("speedCv").getBoundingClientRect(), g = speedGeom();
+  const v = gLo + ((g.y0 - (e.clientY - r.top)) / (g.y0 - g.y1)) * (gHi - gLo);
+  const apply = (w, val) => {
+    if (hit.key === "y") w.p[1] = +val.toFixed(3);
+    else {
+      _ge.setFromQuaternion(_gq.set(...w.q), "YXZ");
+      if (hit.key === "yaw") _ge.y = val / R2D;
+      else _ge.x = clamp(val, -85, 85) / R2D;
+      _ge.z = 0;
+      w.q = _gq.setFromEuler(_ge).toArray().map((x) => +x.toFixed(6));
+    }
+  };
+  if (speedDrag.group && speedDrag.group.length > 1) {
+    const dv = v - speedDrag.base[hit.i];
+    speedDrag.group.forEach((i) => apply(pathData.waypoints[i], speedDrag.base[i] + dv));
+  } else apply(pathData.waypoints[hit.i], v);
+  rebuildPath();
+}
+// sideways drag of dots = move those points in time. Several selected: they move together, or with Alt / Cmd they spread out / squeeze in.
+function speedTimeFromX(d, e) {
+  const g = speedGeom(), wps = pathData.waypoints, n = wps.length;
+  const idx = (d.group && d.group.length > 1 ? d.group : [d.i]).filter((i) => i > 0 && i < n - 1).sort((a, b) => a - b);
+  if (!idx.length) return hudFlash("The first and last points stay at the start and the end");
+  const dt = (e.clientX - d.sx) / (g.x1 - g.x0);
+  const c = d.tBase[idx[0]], span = d.tBase[idx[idx.length - 1]] - c;
+  const scale = d.spread && idx.length > 1 ? Math.max(0.1, 1 + dt / Math.max(span, 0.02)) : null;
+  idx.forEach((i) => {
+    const t = scale != null ? c + (d.tBase[i] - c) * scale : d.tBase[i] + dt;
+    wps[i].t = +clamp(t, T_GAP * i, 1 - T_GAP * (n - 1 - i)).toFixed(4);
+  });
+  rebuildPath();
+}
+function speedSetFromY(hit, e) {
+  if (hit.kind === "snode") return seriesSetFromY(hit, e);
+  const r = $("speedCv").getBoundingClientRect(), g = speedGeom();
+  const v = Math.max(0, ((g.y0 - (e.clientY - r.top)) / (g.y0 - g.y1)) * speedYMax);
+  const wps = pathData.waypoints;
+  if (hit.kind === "hout" || hit.kind === "hin") {
+    const w = wps[hit.i], out = hit.kind === "hout", vv = +Math.max(v, 0.02).toFixed(3);
+    // sideways = influence (how far the ease reaches along the stretch)
+    const tx = (e.clientX - r.left - g.x0) / (g.x1 - g.x0);
+    const hseg = out ? speedDrag.hr : speedDrag.hl;
+    if (hseg > 0) {
+      const infl = +clamp(out ? (tx - wpT[hit.i]) / hseg : (wpT[hit.i] - tx) / hseg, 0.02, 0.95).toFixed(3);
+      if (out) w.io = infl; else w.ii = infl;
+    }
+    if (speedDrag.solo) { // Alt / Cmd: only this side's speed moves, the other keeps what it had
+      if (w.v == null) w.v = +speedDrag.v0.toFixed(3);
+      if (w.vb == null) w.vb = +speedDrag.vi0.toFixed(3);
+      if (out) w.v = vv; else w.vb = vv;
+    } else { w.v = vv; delete w.vb; }
+  } else if (hit.kind === "node") {
+    if (speedDrag.group && speedDrag.group.length > 1) {
+      const dv = v - speedDrag.base[hit.i];
+      speedDrag.group.forEach((i) => { wps[i].v = +Math.max(speedDrag.base[i] + dv, 0.02).toFixed(3); delete wps[i].vb; });
+    } else {
+      wps[hit.i].v = +Math.max(v, 0.02).toFixed(3);
+      delete wps[hit.i].vb;
+    }
+  } else {
+    // a stretch's speed sets how long it takes; the other stretches keep their own times
+    const T = speedDrag.T.slice();
+    T[hit.i] = Math.max((speedDrag.T[hit.i] * speedDrag.vDown) / Math.max(v, 0.08), 0.4); // relative: grabbing the curve does not make it jump
+    const total = T.reduce((a, b) => a + b, 0);
+    let acc = 0;
+    for (let k = 0; k < T.length - 1; k++) { acc += T[k]; wps[k + 1].t = +(acc / total).toFixed(4); }
+    pathData.duration = +total.toFixed(1);
+  }
+  rebuildPath();
+}
+// Double-click a dot: type exact numbers instead of dragging. An in-page box (window.prompt() does not work in the Claude pane).
+let valBox = null;
+// After Effects interpolation presets on the speed graph: Easy ease (F9), Easy ease in (Shift+F9), Easy ease out (Ctrl/Cmd+Shift+F9), Linear
+function applyInterp(idx, kind) {
+  const wps = pathData.waypoints, n = wps.length, m = speedModel();
+  if (!m) return;
+  const F = 0.02; // a tiny speed instead of a dead stop, so the curve stays well-behaved
+  idx.forEach((i) => {
+    const w = wps[i], nd = m.nodes[i], curOut = +nd.v.toFixed(3), curIn = +nd.vi.toFixed(3);
+    if (kind === "ease") { w.v = F; delete w.vb; w.io = w.ii = 0.333; }
+    else if (kind === "easein") { if (i === 0) return; w.v = w.v ?? curOut; w.vb = F; w.ii = 0.333; }
+    else if (kind === "easeout") { if (i === n - 1) return; w.vb = w.vb ?? w.v ?? curIn; w.v = F; w.io = 0.333; }
+    else if (kind === "linear") {
+      const sOut = i < n - 1 ? m.segs[i].v : null, sIn = i > 0 ? m.segs[i - 1].v : null;
+      w.v = +(sOut ?? sIn).toFixed(3); w.vb = +(sIn ?? sOut).toFixed(3);
+      if (Math.abs(w.v - w.vb) < 1e-6) delete w.vb;
+      w.io = w.ii = 0.333;
+    }
+  });
+  save(); rebuildPath(); speedDirty = true;
+  hudFlash({ ease: "Easy ease", easein: "Easy ease in", easeout: "Easy ease out", linear: "Linear" }[kind] + (idx.length > 1 ? " · " + idx.length + " points" : ""));
+}
+window.addEventListener("keydown", (e) => {
+  if (!AUTHOR || !speedOn || gTab !== "speed" || e.key !== "F9" || /^(INPUT|TEXTAREA)$/.test(document.activeElement?.tagName)) return;
+  const idx = gSel.size ? [...gSel] : selected >= 0 ? [selected] : [];
+  if (!idx.length) return hudFlash("Select a point first");
+  e.preventDefault();
+  applyInterp(idx, e.shiftKey ? (e.ctrlKey || e.metaKey ? "easeout" : "easein") : "ease");
+});
+function closeValBox() { if (valBox) valBox.hidden = true; }
+function openValBox(h, e) {
+  const wps = pathData.waypoints, n = wps.length, i = h.i, w = wps[i], dur = Math.max(pathData.duration, 1);
+  if (!valBox) {
+    valBox = document.createElement("div");
+    valBox.id = "valBox";
+    valBox.style.cssText = "position:fixed;z-index:6;padding:10px 12px;border-radius:10px;background:#141416f7;border:1px solid #ffffff33;color:#f3efe8;font:12px system-ui;backdrop-filter:blur(14px);box-shadow:0 8px 28px #0008;min-width:170px";
+    document.body.appendChild(valBox);
+    valBox.addEventListener("keydown", (ev) => { ev.stopPropagation(); if (ev.key === "Escape") closeValBox(); });
+    valBox.addEventListener("pointerdown", (ev) => ev.stopPropagation());
+  }
+  const fields = [];
+  if (gTab === "speed") {
+    // same as After Effects' Keyframe Velocity box: speed and influence for the incoming and the outgoing side
+    const nd = speedModel().nodes[i];
+    if (i > 0) { fields.push({ k: "vi", label: "Speed in (m/s)", val: nd.vi, dec: 2 }); fields.push({ k: "ii", label: "Influence in (%)", val: nd.ii * 100, dec: 1 }); }
+    if (i < n - 1) { fields.push({ k: "vo", label: "Speed out (m/s)", val: nd.v, dec: 2 }); fields.push({ k: "io", label: "Influence out (%)", val: nd.io * 100, dec: 1 }); }
+  }
+  else if (gTab === "look") {
+    const ser = seriesModel("look");
+    ser.forEach((sr) => fields.push({ k: sr.key, label: sr.key === "yaw" ? "Heading (°)" : "Tilt (°)", val: sr.nodes[i].v, dec: 1 }));
+  } else fields.push({ k: "y", label: "Height Y (m)", val: w.p[1], dec: 2 });
+  // exact position in the scene (metres): X and Z across the floor, Y up
+  fields.push({ k: "x", label: "Position X (m)", val: w.p[0], dec: 2 });
+  if (gTab !== "height") fields.push({ k: "y", label: "Position Y (m)", val: w.p[1], dec: 2 });
+  fields.push({ k: "z", label: "Position Z (m)", val: w.p[2], dec: 2 });
+  if (i > 0 && i < n - 1) fields.push({ k: "t", label: "Time (s)", val: wpT[i] * dur, dec: 1 });
+  const grp = gSel.size > 1 && gSel.has(i) ? [...gSel] : [i];
+  valBox.innerHTML = "<div style='opacity:.7;margin-bottom:6px'>Point " + (i + 1) + (grp.length > 1 ? " + " + (grp.length - 1) + " selected" : "") + "</div>" +
+    fields.map((f) => "<label style='display:flex;justify-content:space-between;align-items:center;gap:10px;margin:4px 0'>" + f.label + "<input data-k='" + f.k + "' type='number' step='any' value='" + f.val.toFixed(f.dec) + "' style='width:76px;height:26px;border-radius:6px;border:1px solid #ffffff2a;background:#0e0e10;color:#f3efe8;font-size:13px;padding:0 6px'></label>").join("") +
+    "<div style='display:flex;gap:6px;margin-top:8px'><button data-a='ok' style='flex:1;height:26px;border-radius:6px;border:0;background:#f3efe8;color:#141416;font-weight:600;cursor:pointer'>Set</button>" +
+    (gTab === "speed" ? "<button data-a='auto' style='height:26px;border-radius:6px;border:1px solid #ffffff33;background:none;color:#f3efe8;cursor:pointer'>Auto</button>" : "") +
+    "<button data-a='x' style='height:26px;border-radius:6px;border:1px solid #ffffff33;background:none;color:#f3efe8;cursor:pointer'>✕</button></div>";
+  const ins = [...valBox.querySelectorAll("input")];
+  const done = (auto) => {
+    if (auto) { grp.forEach((j) => { const x = wps[j]; delete x.v; delete x.vb; delete x.io; delete x.ii; }); save(); rebuildPath(); closeValBox(); return hudFlash("Back to automatic"); }
+    ins.forEach((inp, q) => {
+      const f = fields[q], val = parseFloat(inp.value);
+      if (!isFinite(val) || Math.abs(val - +f.val.toFixed(f.dec)) < 1e-9) return;
+      if (f.k === "t") wps[i].t = +clamp(val / dur, T_GAP * i, 1 - T_GAP * (n - 1 - i)).toFixed(4);
+      else grp.forEach((j) => {
+        const x = wps[j];
+        if (f.k === "vo" || f.k === "vi") {
+          const nd0 = speedModel().nodes[j], sv = (k) => +Math.max(k, 0).toFixed(3);
+          const out = f.k === "vo" ? sv(val) : x.v ?? +nd0.v.toFixed(3), inn = f.k === "vi" ? sv(val) : x.vb ?? x.v ?? +nd0.vi.toFixed(3);
+          x.v = out; if (Math.abs(inn - out) < 1e-6) delete x.vb; else x.vb = inn;
+        } else if (f.k === "io") x.io = +clamp(val / 100, 0.02, 0.95).toFixed(3);
+        else if (f.k === "ii") x.ii = +clamp(val / 100, 0.02, 0.95).toFixed(3);
+        else if (f.k === "x") x.p[0] = +val.toFixed(3);
+        else if (f.k === "y") x.p[1] = +val.toFixed(3);
+        else if (f.k === "z") x.p[2] = +val.toFixed(3);
+        else {
+          _ge.setFromQuaternion(_gq.set(...x.q), "YXZ");
+          if (f.k === "yaw") _ge.y = val / R2D; else _ge.x = clamp(val, -85, 85) / R2D;
+          _ge.z = 0;
+          x.q = _gq.setFromEuler(_ge).toArray().map((c) => +c.toFixed(6));
+        }
+      });
+    });
+    save(); rebuildPath(); speedDirty = true; closeValBox();
+  };
+  if (gTab === "speed") {
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex;flex-wrap:wrap;gap:4px;margin-top:8px";
+    [["ease", "Easy ease"], ["easein", "Ease in"], ["easeout", "Ease out"], ["linear", "Linear"]].forEach(([k, t]) => row.insertAdjacentHTML("beforeend", "<button data-a='i:" + k + "' style='height:24px;padding:0 8px;border-radius:6px;border:1px solid #ffffff33;background:none;color:#f3efe8;cursor:pointer;font-size:11px'>" + t + "</button>"));
+    valBox.appendChild(row);
+  }
+  valBox.onclick = (ev) => { const a = ev.target.closest("button")?.dataset.a; if (a === "ok") done(false); else if (a === "auto") done(true); else if (a === "x") closeValBox(); else if (a && a.startsWith("i:")) { applyInterp(grp, a.slice(2)); closeValBox(); } };
+  ins.forEach((inp) => inp.addEventListener("keydown", (ev) => { if (ev.key === "Enter") done(false); }));
+  valBox.hidden = false;
+  valBox.style.left = Math.max(8, Math.min(e.clientX - 90, innerWidth - 200)) + "px";
+  valBox.style.top = Math.max(8, e.clientY - valBox.offsetHeight - 16) + "px";
+  ins[0].focus(); ins[0].select();
+}
+// the graph panel is as tall as you like (drag its top edge), like After Effects' graph editor
+(function () {
+  if (!AUTHOR) return;
+  try { const v = +localStorage.getItem("china26-gph"); if (v >= 160) document.documentElement.style.setProperty("--gph", v + "px"); } catch {}
+  const panel = document.getElementById("speedPanel");
+  if (!panel) return;
+  const grip = document.createElement("div");
+  grip.id = "speedGrip";
+  grip.title = "Drag to make the graph taller or shorter";
+  panel.prepend(grip);
+  grip.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    const y0 = e.clientY, h0 = panel.getBoundingClientRect().height;
+    try { grip.setPointerCapture(e.pointerId); } catch {}
+    const mv = (ev) => {
+      const h = Math.round(Math.max(160, Math.min(innerHeight * 0.7, h0 + (y0 - ev.clientY))));
+      document.documentElement.style.setProperty("--gph", h + "px");
+      speedDirty = true;
+    };
+    const up = () => { grip.removeEventListener("pointermove", mv); grip.removeEventListener("pointerup", up); try { localStorage.setItem("china26-gph", parseInt(getComputedStyle(document.documentElement).getPropertyValue("--gph"))); } catch {} };
+    grip.addEventListener("pointermove", mv);
+    grip.addEventListener("pointerup", up);
+  });
+})();
+function setSpeedPanel(on) {
+  speedOn = !!on;
+  document.body.classList.toggle("speedon", speedOn);
+  $("speedBtn").classList.toggle("on", speedOn);
+  $("speedPanel").hidden = !speedOn;
+  speedDirty = true;
+  if (speedOn) requestAnimationFrame(drawSpeed);
+}
+if (AUTHOR) {
+  $("speedBtn").hidden = false;
+  $("speedBtn").addEventListener("click", () => setSpeedPanel(!speedOn));
+  $("speedX").addEventListener("click", () => setSpeedPanel(false));
+  $("gtSpeed").addEventListener("click", () => setGraphTab("speed"));
+  $("gtLook").addEventListener("click", () => setGraphTab("look"));
+  $("gtHeight").addEventListener("click", () => setGraphTab("height"));
+  $("speedReset").addEventListener("click", () => {
+    let any = false;
+    pathData.waypoints.forEach((w) => { if (w.v != null || w.vb != null || w.io != null || w.ii != null) { delete w.v; delete w.vb; delete w.io; delete w.ii; any = true; } });
+    if (any) { save(); rebuildPath(); hudFlash("All point speeds and handles back to automatic"); } else hudFlash("Nothing to reset");
+  });
+  const cv = $("speedCv");
+  cv.addEventListener("pointerdown", (e) => {
+    const hit = speedPick(e);
+    const rr0 = cv.getBoundingClientRect(), cx = e.clientX - rr0.left, cy = e.clientY - rr0.top;
+    if (!hit) {
+      // empty space: drag a box to select several points
+      e.preventDefault();
+      speedDrag = { kind: "marquee", x0: cx, y0: cy, x1: cx, y1: cy, add: e.shiftKey, moved: false };
+      try { cv.setPointerCapture(e.pointerId); } catch {}
+      return;
+    }
+    e.preventDefault();
+    if ((hit.kind === "node" || hit.kind === "snode") && e.shiftKey) {
+      // Shift + click a dot: add it to / take it off the selection
+      if (!gSel.size && selected >= 0) gSel.add(selected);
+      if (gSel.has(hit.i)) gSel.delete(hit.i); else gSel.add(hit.i);
+      speedDirty = true;
+      return;
+    }
+    const m = speedModel();
+    const nd = m.nodes[hit.i];
+    speedDrag = { ...hit, sx: e.clientX, sy: e.clientY, tBase: wpT.slice(), spread: e.altKey || e.metaKey, T: m.segs.map((s) => s.T), L: m.segs.map((s) => s.L), moved: false, solo: e.altKey || e.metaKey, hr: nd ? nd.hr : 0, hl: nd ? nd.hl : 0, v0: nd ? nd.v : 0, vi0: nd ? nd.vi : 0 };
+    try { cv.setPointerCapture(e.pointerId); } catch {}
+    if (hit.kind === "seg") { const rr = cv.getBoundingClientRect(), gg = speedGeom(); speedDrag.vDown = Math.max(0.05, ((gg.y0 - (e.clientY - rr.top)) / (gg.y0 - gg.y1)) * speedYMax); }
+    if (hit.kind === "node" || hit.kind === "snode") {
+      if (!gSel.has(hit.i)) gSel = new Set([hit.i]);
+      if (gSel.size > 1) { speedDrag.group = [...gSel]; speedDrag.base = graphBase(hit); }
+      selectPoint(hit.i);
+    }
+    if (hit.kind === "hout" || hit.kind === "hin") hudFlash(speedDrag.solo ? "One side only" : "Sideways = influence · up / down = speed (Alt / ⌘ = one side only)");
+    speedDirty = true;
+  });
+  cv.addEventListener("pointermove", (e) => {
+    if (speedDrag && speedDrag.kind === "marquee") {
+      const rr = cv.getBoundingClientRect();
+      speedDrag.x1 = e.clientX - rr.left; speedDrag.y1 = e.clientY - rr.top;
+      if (Math.hypot(speedDrag.x1 - speedDrag.x0, speedDrag.y1 - speedDrag.y0) > 4) speedDrag.moved = true;
+      speedDirty = true;
+      return;
+    }
+    if (speedDrag && (speedDrag.kind === "node" || speedDrag.kind === "snode")) {
+      // a dot moves one way at a time: sideways = in time, up / down = its value
+      if (!speedDrag.axis) {
+        const dx = e.clientX - speedDrag.sx, dy = e.clientY - speedDrag.sy;
+        if (Math.hypot(dx, dy) < 5) return;
+        speedDrag.axis = Math.abs(dx) > Math.abs(dy) ? "x" : "y";
+      }
+      speedDrag.moved = true;
+      if (speedDrag.axis === "x") speedTimeFromX(speedDrag, e); else speedSetFromY(speedDrag, e);
+      return;
+    }
+    if (speedDrag) { speedDrag.moved = true; speedSetFromY(speedDrag, e); return; }
+    const h = speedPick(e);
+    const same = (!h && !speedHover) || (h && speedHover && h.kind === speedHover.kind && h.i === speedHover.i && h.key === speedHover.key);
+    if (!same) { speedHover = h; speedDirty = true; }
+    cv.style.cursor = h ? (h.kind === "node" || h.kind === "snode" ? "move" : "ns-resize") : "default";
+  });
+  const up = () => {
+    const d = speedDrag;
+    if (d && d.kind === "marquee") {
+      const x0 = Math.min(d.x0, d.x1), x1 = Math.max(d.x0, d.x1), y0 = Math.min(d.y0, d.y1), y1 = Math.max(d.y0, d.y1);
+      if (d.moved) {
+        const hits = [...new Set(graphNodeSpots().filter((p) => p.x >= x0 && p.x <= x1 && p.y >= y0 && p.y <= y1).map((p) => p.i))];
+        gSel = d.add ? new Set([...gSel, ...hits]) : new Set(hits);
+        if (hits.length) selectPoint(hits[0]);
+        hudFlash(hits.length ? hits.length + (hits.length === 1 ? " point selected" : " points selected · drag any of them to move them together") : "No points in the box");
+      } else if (!d.add) gSel = new Set();
+    } else if (d && d.moved) save();
+    speedDrag = null;
+    speedDirty = true;
+  };
+  cv.addEventListener("pointerup", up);
+  cv.addEventListener("pointercancel", up);
+  cv.addEventListener("pointerleave", () => { if (!speedDrag && speedHover) { speedHover = null; speedDirty = true; } });
+  cv.addEventListener("dblclick", (e) => {
+    const h = speedPick(e);
+    if (!h) return;
+    const w = pathData.waypoints[h.i];
+    if (h.kind === "node" || h.kind === "snode") openValBox(h, e);
+    else if (h.kind === "hout" || h.kind === "hin") { delete w.io; delete w.ii; delete w.vb; delete w.v; save(); rebuildPath(); hudFlash("Handles back to automatic"); }
+  });
+  window.addEventListener("resize", () => { speedDirty = true; });
+}
+
 // Auto-pace: spread the points over a total time so the camera never moves or turns faster than a comfortable rate.
 // Each stretch gets time for the distance it covers PLUS time for how far the view has to turn.
 const PACE_SPEED = 1.1; // metres per second of travel
@@ -2093,6 +2694,7 @@ function autoPace(total) {
     const head = (Math.acos(clamp(t0.dot(t1), -1, 1)) * 180) / Math.PI; // how much the direction of travel bends
     raw.push(Math.max(L / PACE_SPEED + ang / PACE_TURN + head / (PACE_TURN * 2), 1.2));
   }
+  delete wps[n - 1].t;
   const sum = raw.reduce((a, b) => a + b, 0), k = total / sum;
   let acc = 0;
   for (let i = 0; i < n - 1; i++) {
@@ -2109,11 +2711,32 @@ function autoPace(total) {
 }
 if (AUTHOR) {
   $("paceBtn").hidden = false;
+  // An in-page box instead of window.prompt(), which some browsers (including the Claude pane) don't support.
+  const pp = document.createElement("div");
+  pp.id = "pacePanel";
+  pp.hidden = true;
+  pp.innerHTML = '<div>Total tour length</div><div class="pRow"><input id="paceMin" type="number" min="0" max="20" value="2" inputmode="numeric"><span>min</span><input id="paceSec" type="number" min="0" max="59" value="10" inputmode="numeric"><span>sec</span></div><div class="pRow"><button id="paceGo">Pace it</button><button id="paceX">Cancel</button></div>';
+  document.body.appendChild(pp);
+  const paceClose = () => { pp.hidden = true; $("paceBtn").classList.remove("on"); };
   $("paceBtn").addEventListener("click", () => {
-    const v = window.prompt("Total length in seconds (130 = 2:10):", String(Math.round(pathData.duration < 120 ? 130 : pathData.duration)));
-    const s = Number(v);
-    if (v && s >= 20 && s <= 1200) autoPace(s);
+    if (!pp.hidden) return paceClose();
+    const d = Math.round(pathData.duration < 120 ? 130 : pathData.duration);
+    $("paceMin").value = Math.floor(d / 60);
+    $("paceSec").value = d % 60;
+    pp.hidden = false;
+    $("paceBtn").classList.add("on");
+    $("paceMin").select();
   });
+  const paceApply = () => {
+    const s = (Number($("paceMin").value) || 0) * 60 + (Number($("paceSec").value) || 0);
+    if (s < 20 || s > 1200) return hudFlash("Pick a length between 0:20 and 20:00");
+    paceClose();
+    autoPace(s);
+  };
+  $("paceGo").addEventListener("click", paceApply);
+  $("paceX").addEventListener("click", paceClose);
+  pp.addEventListener("keydown", (e) => { e.stopPropagation(); if (e.key === "Enter") paceApply(); if (e.key === "Escape") paceClose(); });
+  pp.addEventListener("keyup", (e) => e.stopPropagation());
 }
 
 // "Preview as visitor": hide every author tool and show exactly what a visitor gets (tour mode, chapters menu, plain timeline)
