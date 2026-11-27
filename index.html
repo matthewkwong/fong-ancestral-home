@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Fly-through</title>
 <style>
-  :root { color-scheme: dark; --fg:#f3efe8; --dim:#b9b3a8; --accent:#ffb454; }
+  :root { color-scheme: dark; --fg:#f3efe8; --dim:#b9b3a8; --accent:#ffc35c; --ch:#adadad; --ch-now:#ffc35c; --first:#5ee08a; --last:#ff4a4a; --on-accent:#111111; }
   * { box-sizing: border-box; }
   html, body { margin:0; height:100%; background:#0b0b0c; color:var(--fg);
     font: 14px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; overflow:hidden; }
@@ -13,7 +13,7 @@
   body.dragging canvas { cursor:grabbing; }
 
   #veil { position:fixed; inset:0; background:#0b0b0c; opacity:0; pointer-events:none; z-index:1; transition:opacity .3s ease; }
-  #title, #hint, #ui, #ptsRow, #pts, #flash, #author, #editBtn, #prevBtn, #paceBtn { z-index:2; }
+  #title, #hint, #ui, #ptsRow, #pts, #flash, #author, #editBtn, #colBtn, #colPanel, #prevBtn, #paceBtn { z-index:2; }
   #title { display:none; position:fixed; left:20px; top:18px; font-size:15px; letter-spacing:.04em; text-shadow:0 1px 12px #000a; pointer-events:none; }
 
   #loader { position:fixed; inset:0; display:grid; place-content:center; gap:14px; text-align:center;
@@ -34,8 +34,8 @@
   .mk { position:absolute; transform:translateX(-50%); pointer-events:auto; cursor:pointer; text-align:center; font-size:10px; color:var(--dim);
     font-variant-numeric:tabular-nums; line-height:1; user-select:none; }
   .mk i { display:block; font-style:normal; width:20px; height:20px; line-height:20px; margin:0 auto 3px; border-radius:50%;
-    background:#ffb84d; color:#111; font-weight:700; font-size:11px; }
-  .mk.first i { background:#5ee08a; } .mk.last i { background:#ff6b9a; } .mk.sel i { background:#5aa9ff; box-shadow:0 0 0 3px #5aa9ff55; }
+    background:var(--ch); color:var(--on-accent); font-weight:700; font-size:11px; }
+  .mk.first i { background:var(--first); } .mk.last i { background:var(--last); } .mk.sel i { background:var(--ch-now); box-shadow:0 0 0 3px color-mix(in srgb, var(--ch-now) 40%, transparent); }
   .mk:hover i { transform:scale(1.15); }
   #clock { color:var(--dim); font-variant-numeric:tabular-nums; font-size:12px; letter-spacing:.04em; padding-bottom:7px; white-space:nowrap; display:none; }
   body.author #clock { display:block; }
@@ -58,18 +58,19 @@
   #pts .empty { color:var(--dim); padding:8px; }
   #pts .pt { display:flex; align-items:center; gap:10px; padding:6px 8px; border-radius:8px; cursor:pointer; }
   #pts .pt:hover { background:#ffffff14; }
-  #pts .pt.sel { background:#5aa9ff33; }
-  #pts .pt b { width:22px; height:22px; line-height:22px; text-align:center; border-radius:50%; background:#ffb84d; color:#111; font-size:12px; flex:none; }
-  #pts .pt.first b { background:#5ee08a; } #pts .pt.last b { background:#ff6b9a; }
+  #pts .pt.sel { background:color-mix(in srgb, var(--ch-now) 20%, transparent); }
+  #pts .pt b { width:22px; height:22px; line-height:22px; text-align:center; border-radius:50%; background:var(--ch); color:var(--on-accent); font-size:12px; flex:none; }
+  #pts .pt.first b { background:var(--first); } #pts .pt.last b { background:var(--last); }
+  #pts .pt.sel b { background:var(--ch-now); box-shadow:0 0 0 3px color-mix(in srgb, var(--ch-now) 40%, transparent); } /* the selected point in the editor list is gold, like the active chapter in preview */
   /* visitor chapters: grey dots, lit only for the chapter you are in */
-  body:not(.author) #pts .pt b, body.previewing #pts .pt b { background:var(--dim); }
-  body:not(.author) #pts .pt.now b, body.previewing #pts .pt.now b { background:var(--accent); }
-  body:not(.author) .ch i, body.previewing .ch i { background:var(--dim); }
-  body:not(.author) .ch.now i, body.previewing .ch.now i { background:var(--accent); }
+  body:not(.author) #pts .pt b, body.previewing #pts .pt b { background:var(--ch); }
+  body:not(.author) #pts .pt.now b, body.previewing #pts .pt.now b { background:var(--ch-now); box-shadow:0 0 0 3px color-mix(in srgb, var(--ch-now) 40%, transparent); }
+  body:not(.author) .ch i, body.previewing .ch i { background:var(--ch); }
+  body:not(.author) .ch.now i, body.previewing .ch.now i { background:var(--ch-now); box-shadow:0 0 0 3px color-mix(in srgb, var(--ch-now) 40%, transparent); transform:scale(1.2); }
   #pts .pt .nm { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; color:var(--fg); }
   #pts .pt .nm.dflt { color:var(--dim); }
-  #pts .nmIn { flex:1; min-width:0; font:inherit; color:var(--fg); background:#0008; border:1px solid #ffffff40; border-radius:6px; padding:2px 6px; outline:none; }
-  #pts .nmIn:focus { border-color:#5aa9ff; }
+  #pts .nmIn { flex:1; min-width:0; font:inherit; color:var(--fg); background:#0008; border:1px solid #f5f3f140; border-radius:6px; padding:2px 6px; outline:none; }
+  #pts .nmIn:focus { border-color:var(--ch-now); }
   #pts .ren { padding:0 6px; font-size:12px; opacity:0; border:none; background:none; }
   #pts .pt:hover .ren, #pts .pt.sel .ren { opacity:.7; } #pts .ren:hover { opacity:1; }
   #pts .pt span { flex:1; color:var(--dim); } #pts .pt em { font-style:normal; font-variant-numeric:tabular-nums; }
@@ -79,7 +80,119 @@
   button:hover { background:#ffffff26; }
   #playBtn { width:38px; padding:6px 0; }
   #slider { flex:1; accent-color:var(--fg); min-width:60px; }
+  /* editor bar, closer to the visitor player: a soft fade instead of a solid strip, a round play button, a thin gold track */
+  #ui { background:none; border-top:0; backdrop-filter:none; -webkit-backdrop-filter:none; padding:18px 28px calc(20px + env(safe-area-inset-bottom)); gap:16px; }
+  #ui::before { content:""; position:absolute; left:0; right:0; bottom:0; height:200px; z-index:-1; pointer-events:none; backdrop-filter:blur(5px); -webkit-backdrop-filter:blur(5px);
+    -webkit-mask-image:linear-gradient(to top,#000 0%,#000 35%,transparent 100%); mask-image:linear-gradient(to top,#000 0%,#000 35%,transparent 100%); }
+  #ui::after { content:""; position:absolute; left:0; right:0; bottom:0; height:230px; z-index:-1; pointer-events:none;
+    background:linear-gradient(to top,rgba(10,10,12,.64) 0%,rgba(10,10,12,.58) 20%,rgba(10,10,12,.42) 45%,rgba(10,10,12,.21) 70%,rgba(10,10,12,.06) 88%,rgba(10,10,12,0) 100%); }
+  #ui #playBtn { width:44px; height:44px; padding:0; margin:0; border-radius:50%; border:1px solid #ffffff4d; background:#141416f2; display:flex; align-items:center; justify-content:center; font-size:14px; line-height:1; }
+  #ui #playBtn:hover { background:#2a2a2e; }
+  #ui #clock { color:#d4cfc6; line-height:44px; padding-bottom:0; text-shadow:0 1px 12px rgba(0,0,0,.55); }
+  #slider { -webkit-appearance:none; appearance:none; height:2px; border-radius:2px; accent-color:var(--ch-now);
+    background:linear-gradient(to right, var(--ch-now) var(--p, 0%), #ffffff4d var(--p, 0%)); }
+  #slider::-webkit-slider-runnable-track { background:none; height:2px; }
+  #slider::-webkit-slider-thumb { -webkit-appearance:none; appearance:none; width:14px; height:14px; margin-top:-6px; border-radius:50%; border:0; background:var(--ch-now);
+    box-shadow:0 0 0 4px color-mix(in srgb, var(--ch-now) 25%, transparent); }
+  #slider::-moz-range-thumb { width:14px; height:14px; border-radius:50%; border:0; background:var(--ch-now); box-shadow:0 0 0 4px color-mix(in srgb, var(--ch-now) 25%, transparent); }
 
+
+  /* visitor playback bar: a hairline with a dot for each chapter. Chapters are moments, so a name only shows near its dot.
+     Legibility: a soft blur then a dark fade sit behind it (the ::before / ::after layers). */
+  #vtl { position:fixed; left:0; right:0; bottom:0; z-index:2; display:none; pointer-events:none;
+    padding:0 28px calc(20px + env(safe-area-inset-bottom));
+    transition:opacity .45s ease, transform .3s ease, visibility .45s; }
+  #vtl::before { content:""; position:absolute; left:0; right:0; bottom:0; height:190px; pointer-events:none;
+    backdrop-filter:blur(5px); -webkit-backdrop-filter:blur(5px);
+    -webkit-mask-image:linear-gradient(to top,#000 0%,#000 35%,transparent 100%); mask-image:linear-gradient(to top,#000 0%,#000 35%,transparent 100%); }
+  #vtl::after { content:""; position:absolute; left:0; right:0; bottom:0; height:220px; pointer-events:none;
+    background:linear-gradient(to top,rgba(10,10,12,.64) 0%,rgba(10,10,12,.58) 20%,rgba(10,10,12,.42) 45%,rgba(10,10,12,.21) 70%,rgba(10,10,12,.06) 88%,rgba(10,10,12,0) 100%); }
+  body.chapters:not(.author) #vtl, body.chapters.previewing #vtl { display:block; }
+  body.chapters:not(.author) #ui, body.chapters.previewing #ui { display:none; }
+  body:not(.has-path) #vtl { display:none !important; }
+  body:not(.author)[data-mode="free"] #vtl { opacity:0; visibility:hidden; pointer-events:none; transform:translateY(90px); }
+  #vtl .vin { position:relative; z-index:1; pointer-events:auto; }
+  #vtl .vtop { position:relative; display:flex; align-items:flex-end; gap:16px; }
+  #vtl #vPlay, #vtl #vReset { width:44px; height:44px; padding:0; border-radius:50%; border:1px solid #ffffff4d; background:#141416f2;
+    display:flex; align-items:center; justify-content:center; flex:none; }
+  #vtl #vPlay:hover, #vtl #vReset:hover { background:#2a2a2e; }
+  /* at the end of the tour, Restart takes the place of Play / Pause */
+  #vtl #vReset { display:none; width:44px; height:44px; margin:0; order:-1; }
+  body.ended #vtl #vReset { display:flex; }
+  body.ended #vtl #vPlay { display:none; }
+  #vtl svg { display:block; }
+  #vtl .ic-pause, #vtl.playing .ic-play { display:none; }
+  #vtl.playing .ic-pause { display:block; }
+  #vtl #vClock { flex:none; line-height:44px; font-size:12px; letter-spacing:.04em; color:#d4cfc6; font-variant-numeric:tabular-nums; white-space:nowrap; text-shadow:0 1px 12px rgba(0,0,0,.55); }
+  #vTrack { position:relative; flex:1; min-width:0; height:72px; cursor:pointer; touch-action:none; user-select:none; -webkit-user-select:none; }
+  #vLine, #vFill { position:absolute; left:0; bottom:21px; height:2px; border-radius:2px; }
+  #vLine { right:0; background:#ffffff4d; }
+  #vFill { width:0; background:var(--ch-now); }
+  #vMarks { position:absolute; left:7px; right:7px; top:0; bottom:0; pointer-events:none; }
+  #vtl .vmk { position:absolute; bottom:11px; width:22px; height:22px; margin-left:-11px; padding:0; border:0; border-radius:0; background:none;
+    display:flex; align-items:center; justify-content:center; pointer-events:auto; z-index:2; }
+  #vtl .vmk:hover { background:none; }
+  #vtl .vmk:focus-visible { outline:2px solid var(--ch-now); outline-offset:1px; border-radius:50%; }
+  #vtl .vmk i { display:block; width:7px; height:7px; border-radius:50%; background:var(--ch); opacity:.55; transition:width .2s, height .2s, opacity .2s, box-shadow .2s; }
+  #vtl .vmk.done i { background:var(--ch); opacity:1; }
+  #vtl .vmk.on i, #vtl .vmk:hover i { width:12px; height:12px; background:var(--ch-now); opacity:1; box-shadow:0 0 0 4px color-mix(in srgb, var(--ch-now) 25%, transparent); }
+  #vCap { margin:0 0 -8px 0; line-height:1.15; text-shadow:0 1px 12px rgba(0,0,0,.55); opacity:0; transition:opacity .3s; pointer-events:none; height:40px; }
+  #vCapNum { font-size:11px; letter-spacing:.1em; color:#d4cfc6; }
+  #vCapName { font-size:24px; letter-spacing:-.01em; color:#fff; white-space:nowrap; }
+  #vtl .vmk .lbl { position:absolute; bottom:calc(100% + 4px); left:50%; transform:translateX(-50%); white-space:nowrap; font-size:13px; letter-spacing:.03em;
+    color:#fff; opacity:0; transition:opacity .25s; pointer-events:none; padding:7px 11px; border-radius:8px; background:#141416; border:1px solid #ffffff2e; }
+  #vtl .vmk .lbl b { font-weight:400; }
+  #vtl .vmk .lbl em { display:inline; font-style:normal; margin-left:7px; color:#d4cfc6; font-size:11px; font-variant-numeric:tabular-nums; }
+  #vtl .vmk:hover .lbl, #vtl .vmk:focus-visible .lbl { opacity:1; }
+  #vtl .vmk:hover .lbl em, #vtl .vmk:focus-visible .lbl em { display:inline; }
+  #vtl .vmk.first .lbl { left:4px; transform:none; }
+  #vtl .vmk.last .lbl { left:auto; right:4px; transform:none; }
+  #vHead { position:absolute; left:0; bottom:15px; width:14px; height:14px; margin-left:-7px; border-radius:50%; background:var(--ch-now);
+    box-shadow:0 0 0 4px color-mix(in srgb, var(--ch-now) 25%, transparent); pointer-events:none; z-index:3; }
+  /* resting state: only a thin progress line (and a chapter name when one comes up); hover or tap under it to open the full bar */
+  #vtl::before, #vtl::after { transition:opacity .35s ease; }
+  #vtl .vtop { transition:opacity .35s ease, transform .35s ease; }
+  #vCap { transition:opacity .3s, transform .35s ease; --cap-dy:25px; --cap-dx:60px; }
+  #vHot { position:absolute; left:0; right:0; bottom:0; height:calc(72px + env(safe-area-inset-bottom)); z-index:1; pointer-events:none; }
+  #vtl .vnav, #vtl .vt { display:none; }
+  #vtl #vPlay, #vtl #vReset, #vtl #vClock, #vtl #vMarks, #vtl .vnav, #vtl .vt { transition:opacity .35s ease, background .2s; }
+  /* resting: the track line stays exactly where it is; the play button, clock and dots just fade away around it */
+  body:not(.ended) #vtl.min .vin { pointer-events:none; }
+  body:not(.ended) #vtl.min #vHot { pointer-events:auto; }
+  body:not(.ended) #vtl.min #vPlay, body:not(.ended) #vtl.min #vClock, body:not(.ended) #vtl.min #vMarks, body:not(.ended) #vtl.min .vnav, body:not(.ended) #vtl.min .vt { opacity:0; pointer-events:none; }
+  body:not(.ended) #vtl.min #vCap { transform:translate(var(--cap-dx), var(--cap-dy)); }
+  body:not(.ended) #vtl.min::before { opacity:0; }
+  body:not(.ended) #vtl.min::after { opacity:.55; }
+  @media (max-width:640px), (pointer:coarse) {
+    /* phones: chapter name, a full-width track, then a pager row: elapsed | prev  play  next | total. Resting leaves only the name and the track. */
+    #vtl { padding:0 20px calc(20px + env(safe-area-inset-bottom)); }
+    #vtl::before { height:200px; backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px); }
+    #vtl::after { height:240px; }
+    #vtl .vtop { display:grid; grid-template-columns:1fr auto auto auto 1fr; grid-template-areas:"track track track track track" "t0 prev play next t1"; align-items:center; column-gap:10px; row-gap:4px; }
+    #vTrack { grid-area:track; height:36px; }
+    #vLine, #vFill { bottom:12px; }
+    #vtl #vPlay { grid-area:play; width:60px; height:60px; background:#f3efe8; color:#141416; border-color:transparent; }
+    #vtl #vPlay:hover { background:#fff; }
+    #vtl #vPlay svg { width:20px; height:20px; }
+    #vtl .vnav { display:flex; width:44px; height:44px; padding:0; border:0; border-radius:50%; align-items:center; justify-content:center; color:#f3efe8; background:none; }
+    #vtl .vnav:hover { background:#ffffff1a; }
+    #vtl #vPrev { grid-area:prev; }
+    #vtl #vNext { grid-area:next; }
+    body.ended #vtl #vNext { visibility:hidden; }
+    #vtl .vt { display:block; font-size:12px; letter-spacing:.04em; color:#d4cfc6; font-variant-numeric:tabular-nums; text-shadow:0 1px 12px rgba(0,0,0,.55); }
+    #vtl #vT0 { grid-area:t0; justify-self:start; }
+    #vtl #vT1 { grid-area:t1; justify-self:end; }
+    #vtl #vClock { display:none; }
+    #vtl #vReset { grid-area:play; width:60px; height:60px; background:#f3efe8; color:#141416; border-color:transparent; }
+    #vtl #vReset:hover { background:#fff; }
+    #vtl #vReset svg { width:22px; height:22px; }
+    #vtl .vmk { width:14px; margin-left:-7px; bottom:2px; }
+    #vHead { bottom:6px; }
+    #vCap { margin:0 0 4px 0; height:40px; --cap-dx:0px; --cap-dy:64px; }
+    #vCapName { font-size:22px; }
+    body:not(.ended) #vtl.min .vtop { transform:translateY(64px); }
+  }
+  @media (prefers-reduced-motion:reduce) { #vtl, #vtl::before, #vtl::after, #vtl .vtop, #vCap, #hint, #hintQ, #vtl .vmk .lbl, #vtl .vmk i { transition:none !important; } }
   body:not(.author) #ptsRow { top:18px; }
   body:not(.author) #pts { top:62px; }
   body.chapters #marks { display:block; }
@@ -89,21 +202,62 @@
   .ch span { position:absolute; bottom:30px; left:50%; transform:translateX(-50%); background:#141416f2; border:1px solid #ffffff1f; padding:3px 9px;
     border-radius:6px; font-size:12px; white-space:nowrap; opacity:0; pointer-events:none; transition:.15s; }
   .ch:hover span { opacity:1; }
-  .ch:hover i { transform:scale(1.3); background:var(--accent); }
-  body.previewing #paceBtn, body.previewing #editBtn, body.previewing #eraseBtn { display:none; }
+  .ch:hover i { transform:scale(1.3); background:var(--ch-now); }
+  body.previewing #paceBtn, body.previewing #editBtn, body.previewing #eraseBtn, body.previewing #colBtn, body.previewing #colPanel { display:none; }
   body:not(.editing):not(.erasing) #paceBtn, body:not(.editing):not(.erasing) #eraseBtn { display:none; }
   body.author #hint { max-width:min(420px, max(180px, calc(100vw - 800px))); }
-  #prevBtn.on { background:var(--accent); color:#111; }
-  #ptsBtn.on, #editBtn.on { background:var(--accent); color:#111; }
-  body.editing canvas { cursor:crosshair; }
+  #prevBtn.on { background:var(--ch-now); color:var(--on-accent); }
+  #ptsBtn.on, #editBtn.on, #colBtn.on, #ctBtn.on { background:var(--ch-now); color:var(--on-accent); }
+  body.editing canvas, body.coling canvas { cursor:crosshair; }
+
+  body.author:not(.editing):not(.previewing) #ctBtn, body.author:not(.editing):not(.previewing) #ctPanel { display:none; } /* Colors stays available in the visitor preview so you can tune colors on the real view */
+  #ctPanel { position:fixed; right:266px; top:62px; z-index:3; width:272px; background:#141416f2; color:#f3efe8; border:1px solid #ffffff22; border-radius:12px; padding:12px; font-size:12px; }
+  #ctPanel[hidden], #ctBtn[hidden] { display:none; }
+  #ctPanel .cr { display:flex; align-items:center; gap:8px; margin-top:8px; }
+  #ctPanel .cr span { flex:1; line-height:1.25; } #ctPanel .cr small { display:block; opacity:.6; }
+  #ctPanel input[type=color] { width:34px; height:26px; padding:0; border:1px solid #ffffff30; border-radius:6px; background:none; cursor:pointer; }
+  #ctPanel input[type=text] { width:78px; font:inherit; font-size:12px; padding:4px 6px; border-radius:6px; border:1px solid #ffffff30; background:#0008; color:inherit; }
+  #ctPanel .cb { display:flex; gap:6px; margin-top:12px; }
+  #ctPanel button { font:inherit; font-size:12px; padding:5px 10px; border-radius:7px; border:1px solid #ffffff30; background:#ffffff12; color:inherit; cursor:pointer; }
+  #ctPanel button:hover { background:#ffffff26; }
+  #ctPanel pre { margin:10px 0 0; padding:8px; background:#0008; border-radius:6px; font-size:11px; white-space:pre-wrap; user-select:all; }
+  #colPanel { position:fixed; right:16px; top:64px; width:250px; background:#141416ee; color:#f3efe8; border:1px solid #ffffff22; border-radius:10px; padding:10px 12px; font-size:12px; line-height:1.45; }
+  #colPanel b { color:var(--ch-now); }
+  #colPanel .cr { display:flex; gap:6px; flex-wrap:wrap; margin-top:8px; }
+  #colPanel button { font:inherit; font-size:12px; padding:4px 9px; border-radius:7px; border:1px solid #ffffff30; background:#ffffff12; color:inherit; cursor:pointer; }
+  #colPanel button:hover { background:#ffffff24; }
+  #colPanel label { display:flex; gap:6px; align-items:center; margin-top:8px; cursor:pointer; }
+  #colPanel small { opacity:.65; display:block; margin-top:6px; }
   /* Top-left legend: a dark frosted pill so it reads over bright or busy parts of the scene */
   #hint { position:fixed; left:20px; top:18px; max-width:min(420px, calc(100vw - 300px)); color:#f3efe8; font-size:12.5px; line-height:1.45; letter-spacing:.01em; text-align:left; pointer-events:none;
     padding:8px 14px; border-radius:10px; background:#141416d9; backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px); border:1px solid #ffffff1f; box-shadow:0 4px 18px #0006; }
+  /* the control hint shows until the visitor first moves in a mode, then eases out and a small "?" eases in at the top left; hover or tap it to bring the hint back */
+  #hint { transition:opacity .4s cubic-bezier(.22,.61,.36,1), transform .4s cubic-bezier(.22,.61,.36,1), visibility .4s; }
+  #hintQ { display:flex; position:fixed; left:20px; top:18px; width:30px; height:30px; padding:0; border-radius:50%; align-items:center; justify-content:center;
+    font-size:14px; line-height:1; color:#f3efe8; background:#141416d9; border:1px solid #ffffff3d; backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px); z-index:4;
+    opacity:0; visibility:hidden; transform:scale(.8); pointer-events:none;
+    transition:opacity .4s cubic-bezier(.22,.61,.36,1) .15s, transform .4s cubic-bezier(.22,.61,.36,1) .15s, visibility .4s, background .2s; }
+  #hintQ:hover, body.hint-open #hintQ { background:#2a2a2e; }
+  #hintQ .x { display:none; }
+  body.hint-pinned #hintQ .q { display:none; }
+  body.hint-pinned #hintQ .x { display:block; }
+  body:not(.author).moved-tour[data-mode="tour"] #hintQ,
+  body:not(.author).moved-free[data-mode="free"] #hintQ,
+  body.previewing.moved-tour[data-mode="tour"] #hintQ,
+  body.previewing.moved-free[data-mode="free"] #hintQ { opacity:1; visibility:visible; transform:none; pointer-events:auto; }
+  body:not(.author).moved-tour[data-mode="tour"]:not(.hint-open) #hint,
+  body:not(.author).moved-free[data-mode="free"]:not(.hint-open) #hint,
+  body.previewing.moved-tour[data-mode="tour"]:not(.hint-open) #hint,
+  body.previewing.moved-free[data-mode="free"]:not(.hint-open) #hint { opacity:0; visibility:hidden; transform:translateY(-6px); }
+  body:not(.author).moved-tour[data-mode="tour"] #hint,
+  body:not(.author).moved-free[data-mode="free"] #hint,
+  body.previewing.moved-tour[data-mode="tour"] #hint,
+  body.previewing.moved-free[data-mode="free"] #hint { left:58px; }
   body[data-mode="free"] .tour-hint, body[data-mode="free"] .tour-hint-touch, body[data-mode="tour"] .free-hint { display:none; }
 
   #author { position:fixed; left:20px; top:52px; padding:12px 14px; border-radius:12px; background:#141416d9;
     border:1px solid #ffffff1a; backdrop-filter:blur(14px); font-size:12px; max-width:330px; }
-  #author b { color:var(--accent); font-weight:600; }
+  #author b { color:var(--ch-now); font-weight:600; }
   #author kbd { background:#ffffff1c; border-radius:4px; padding:1px 6px; font:inherit; font-family:ui-monospace,Consolas,monospace; }
   #author .row { display:flex; justify-content:space-between; gap:16px; margin-top:4px; color:var(--dim); }
   #author .sep { height:1px; background:#ffffff1a; margin:8px 0 2px; }
@@ -113,11 +267,11 @@
   #pad, #vert { display:none; position:fixed; z-index:2; user-select:none; -webkit-user-select:none; -webkit-touch-callout:none; touch-action:none; }
   #pad { left:calc(22px + env(safe-area-inset-left)); bottom:calc(28px + env(safe-area-inset-bottom)); width:132px; height:132px; border-radius:50%;
     background:#141416b3; border:1px solid #ffffff33; backdrop-filter:blur(10px); transition:border-color .2s, box-shadow .2s; }
-  #pad.fast { border-color:var(--accent); box-shadow:0 0 0 2px #ffb45440; }
+  #pad.fast { border-color:var(--ch-now); box-shadow:0 0 0 2px #f5f3f140; }
   #stick { position:absolute; left:50%; top:50%; width:54px; height:54px; border-radius:50%; background:#f3efe8d9; transform:translate(-50%,-50%); pointer-events:none; }
   #vert { right:calc(22px + env(safe-area-inset-right)); bottom:calc(28px + env(safe-area-inset-bottom)); flex-direction:column; gap:12px; }
   #vert button { width:64px; height:64px; padding:0; border-radius:50%; font-size:12px; background:#141416b3; backdrop-filter:blur(10px); touch-action:none; }
-  #vert button.held { background:var(--accent); color:#111; }
+  #vert button.held { background:var(--ch-now); color:var(--on-accent); }
   .free-hint-touch, .tour-hint-touch { display:none; }
   @media (pointer:coarse) {
     body[data-mode="free"] #pad { display:block; }
@@ -128,16 +282,34 @@
     body[data-mode="tour"] .tour-hint-touch { display:inline; }
     body.previewing #pad, body.previewing #vert { display:none !important; }
   }
-  /* phones: no title; the control hint is a solid dark strip across the top, in plain bright text */
+  /* phones: a small, quiet hint pill on the top row with the buttons pushed down under it. Once it folds away, the "?" and the buttons share one row. */
   @media (max-width:640px), (pointer:coarse) {
     #title { display:none; }
-    #hint { left:0; right:0; top:0; bottom:auto; max-width:none; border:0; border-radius:0; box-shadow:none; backdrop-filter:none; -webkit-backdrop-filter:none; text-align:center; background:#17171a; color:#f3efe8; text-shadow:none; z-index:3;
-      font-size:13px; line-height:18px; padding:calc(9px + env(safe-area-inset-top)) 16px 9px; }
+    body { --tb:calc(12px + env(safe-area-inset-top)); --hintH:40px; }
+    body:not(.author).moved-tour[data-mode="tour"],
+    body:not(.author).moved-free[data-mode="free"],
+    body.previewing.moved-tour[data-mode="tour"],
+    body.previewing.moved-free[data-mode="free"] { --hintH:0px; }
+    body:not(.author).moved-tour[data-mode="tour"].hint-open,
+    body:not(.author).moved-free[data-mode="free"].hint-open,
+    body.previewing.moved-tour[data-mode="tour"].hint-open,
+    body.previewing.moved-free[data-mode="free"].hint-open { --hintH:40px; }
+    #hint { left:16px; right:16px; top:calc(var(--tb) + 44px); bottom:auto; max-width:none; padding:0; border:0; border-radius:0; background:none; box-shadow:none; backdrop-filter:none; -webkit-backdrop-filter:none;
+      display:flex; justify-content:center; text-align:center; font-size:12.5px; line-height:16px; color:#f3efe8e0; text-shadow:none; z-index:3; }
+    #hint span { flex:1; padding:8px 14px; border-radius:12px; background:rgba(20,20,22,.5); backdrop-filter:blur(10px); -webkit-backdrop-filter:blur(10px); }
+    body:not(.author).moved-tour[data-mode="tour"] #hint,
+    body:not(.author).moved-free[data-mode="free"] #hint,
+    body.previewing.moved-tour[data-mode="tour"] #hint,
+    body.previewing.moved-free[data-mode="free"] #hint { left:16px; }
+    #hintQ:hover { background:#141416d9; }
+    body.hint-open #hintQ { background:#2a2a2e; }
+    #hintQ { left:16px; top:var(--tb); width:36px; height:36px;
+      transition:opacity .4s cubic-bezier(.22,.61,.36,1) .15s, transform .4s cubic-bezier(.22,.61,.36,1) .15s, visibility .4s, background .2s, top .4s cubic-bezier(.22,.61,.36,1); }
     #resetBtn { display:none; width:38px; height:38px; padding:0; border-radius:50%; font-size:18px; line-height:1; flex:none; }
     #resetBtn .lbl { display:none; }
     body.ended #resetBtn { display:block; animation:fadeIn .45s ease; }
-    body:not(.author) #ptsRow { top:calc(52px + env(safe-area-inset-top)); }
-    body:not(.author) #pts { top:calc(92px + env(safe-area-inset-top)); }
+    body:not(.author) #ptsRow { right:16px; top:var(--tb); }
+    body:not(.author) #pts { right:16px; top:calc(var(--tb) + 44px + var(--hintH)); }
   }
   /* author helpers: live coordinates, and a small window showing how the selected point will look in the tour */
   #coords { position:fixed; left:20px; bottom:calc(96px + var(--gh)); z-index:2; padding:7px 11px; border-radius:9px; background:#141416d9; border:1px solid #ffffff1f;
@@ -150,7 +322,7 @@
   #erasePanel input[type=range] { width:130px; vertical-align:middle; }
   #erasePanel button { background:#ffffff1c; color:#f3efe8; border:1px solid #ffffff2a; border-radius:6px; padding:4px 9px; cursor:pointer; font-size:12px; }
   #erasePanel button:hover { background:#ffffff30; }
-  #eraseBtn.on { background:#ff6b6b; color:#111; }
+  #eraseBtn.on { background:#ff6b6b; color:var(--on-accent); }
   body.erasing canvas { cursor:crosshair; }
   /* with the Erase panel open at the bottom right, keep the Points list and the camera preview clear of it */
   body.erasing #pts { max-height:calc(100vh - 62px - 96px - 200px); }
@@ -174,46 +346,62 @@
   #pacePanel .pRow { display:flex; gap:6px; align-items:center; margin-top:8px; }
   #pacePanel input { width:54px; height:30px; border-radius:6px; border:1px solid #ffffff2a; background:#0e0e10; color:#f3efe8; font-size:14px; padding:0 8px; }
   #pacePanel button { flex:1; height:30px; border-radius:6px; border:1px solid #ffffff2a; background:#ffffff14; color:#f3efe8; cursor:pointer; }
-  #pacePanel #paceGo { background:var(--accent); color:#111; border-color:transparent; }
-  #paceBtn.on { background:var(--accent); color:#111; }
+  #pacePanel #paceGo { background:var(--ch-now); color:var(--on-accent); border-color:transparent; }
+  #paceBtn.on { background:var(--ch-now); color:var(--on-accent); }
   :root { --gh:0px; --gph:300px; }
   body.speedon.editing { --gh:calc(var(--gph) + 12px); }
   #speedGrip { position:absolute; left:0; right:0; top:-5px; height:10px; cursor:ns-resize; z-index:4; display:flex; justify-content:center; align-items:center; }
-  #speedGrip::after { content:""; width:44px; height:4px; border-radius:2px; background:#ffffff40; }
+  #speedGrip::after { content:""; width:44px; height:4px; border-radius:2px; background:#f5f3f140; }
   #speedGrip:hover::after { background:#ffffff90; }
   #speedPanel { position:absolute; left:0; right:0; bottom:calc(100% + 12px); height:var(--gph); z-index:3; border-radius:10px; background:#141416f2; border:1px solid #ffffff22; color:#f3efe8; font-size:12px; backdrop-filter:blur(14px); display:flex; flex-direction:column; }
   #speedPanel[hidden], body:not(.editing) #speedPanel { display:none; }
   #speedPanel .spHead { display:flex; align-items:center; gap:12px; padding:7px 10px 0; }
-  #speedPanel .spHead b { color:#ffb454; font-weight:600; }
+  #speedPanel .spHead b { color:#f5f3f1; font-weight:600; }
   #speedPanel .spHead span { color:#d8d3ca; font-size:11px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   #speedPanel .spHelp { flex:1; opacity:.7; min-width:0; }
   #speedPanel button { all:unset; cursor:pointer; padding:3px 8px; border-radius:6px; background:#ffffff1c; border:1px solid #ffffff2a; font-size:11px; }
   #speedPanel button:hover { background:#ffffff30; }
   #speedPanel .spTabs { display:flex; gap:4px; }
-  #speedPanel .spTabs button.on { background:var(--accent); color:#111; border-color:transparent; }
+  #speedPanel .spTabs button.on { background:var(--ch-now); color:var(--on-accent); border-color:transparent; }
   #speedPanel [hidden] { display:none; }
   #speedPanel #speedCv { position:relative; inset:auto; flex:1 1 0; width:100%; height:auto; min-height:0; display:block; touch-action:none; cursor:default; }
   body.erasing #speedBtn, body:not(.editing):not(.erasing) #speedBtn { display:none; }
-  #speedBtn.on { background:var(--accent); color:#111; }
+  #speedBtn.on { background:var(--ch-now); color:var(--on-accent); }
 </style>
 </head>
 <body data-mode="free">
   <div id="veil"></div>
   <div id="title"></div>
   <div id="ptsRow">
-    <button id="paceBtn" hidden title="Spread the points over a set time with comfortable speed and turns">⏱ Auto-pace</button>
-    <button id="speedBtn" hidden title="Graphs of speed, look direction and height along the path">📈 Graphs</button>
-    <button id="eraseBtn" hidden title="Click stray splats to mark them for removal (K)">✂ Erase</button>
-    <button id="editBtn" hidden title="Edit the path (M)">✎ Edit path</button>
-    <button id="prevBtn" hidden title="See what visitors will see">👁 Preview</button>
+    <button id="paceBtn" hidden title="Spread the points over a set time with comfortable speed and turns">Auto-pace</button>
+    <button id="speedBtn" hidden title="Graphs of speed, look direction and height along the path">Graphs</button>
+    <button id="eraseBtn" hidden title="Click stray splats to mark them for removal (K)">Erase</button>
+    <button id="colBtn" hidden title="Draw collision walls so visitors can't walk through them (B)">Walls</button>
+    <button id="ctBtn" hidden title="Try colors live">Colors</button>
+    <button id="editBtn" hidden title="Edit (M)">Edit</button>
+    <button id="prevBtn" hidden title="See what visitors will see">Preview</button>
     <button id="modeBtn" title="Switch between tour and free roam (T)">Explore freely</button>
-    <button id="ptsBtn" hidden title="List of points (L)">☰ Points</button>
+    <button id="ptsBtn" hidden title="List of points (L)">Points</button>
+  </div>
+  <div id="colPanel" hidden>
+    <b>Collision walls</b> · <span id="colCount"></span>
+    <small style="margin-top:4px">Click the floor along the base of a wall to drop points. Click the first point to close a shape (a solid surface, like a table). <kbd>Enter</kbd> finishes a wall.</small>
+    <small>Drag a point to move it · double-click a line to add a point · right-click or <kbd>⌫</kbd> deletes a point · click an end point to keep drawing.</small>
+    <div class="cr"><button id="colUndo">Undo</button><button id="colDelWall">Delete wall</button><button id="colClose">Close / open</button><button id="colClear">Clear all</button></div>
+    <label><input type="checkbox" id="colAuto"> Also auto-detect walls from the scan</label>
+  </div>
+  <div id="ctPanel" hidden>
+    <b>Color tester</b> <small style="opacity:.6">· changes show instantly</small>
+    <div id="ctRows"></div>
+    <div class="cb"><button id="ctCopy">Copy values</button><button id="ctReset">Reset</button></div>
+    <pre id="ctOut"></pre>
   </div>
   <div id="pts" hidden></div>
+  <button id="hintQ" aria-label="Show controls" aria-expanded="false"><span class="q">?</span><svg class="x" width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><path d="M2 2l8 8M10 2l-8 8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button>
   <div id="hint">
     <span class="tour-hint">Scroll or swipe to move. Drag to look around.</span>
     <span class="tour-hint-touch">Use the timeline to move. Drag to look around.</span>
-    <span class="free-hint-touch">Left stick to move. Drag to look. Rim = sprint.</span>
+    <span class="free-hint-touch">Left stick to move. Drag to look.</span>
     <span class="free-hint">W A S D to move · Q / E down / up · drag to look · scroll = speed</span>
   </div>
 
@@ -222,6 +410,24 @@
     <div id="track"><div id="speedPanel" hidden><div class="spHead"><div class="spTabs"><button id="gtSpeed" class="on">Speed</button><button id="gtLook">Look</button><button id="gtHeight">Height</button></div><span id="speedTotal"></span><span class="spHelp" id="speedHelp">dots: up / down = speed, sideways = move in time, double-click = type a value, F9 = easy ease (select several, hold Alt / ⌘ to spread them out) · click one to show its handles · handles: sideways = influence, up / down = speed, Alt / ⌘ = one side · drag the curve between points to speed up / slow down that stretch · double-click to reset · drag empty space to select several points (Shift = add)</span><button id="speedReset" title="Put every point speed and handle back to automatic">Reset all</button><button id="speedX" title="Close">✕</button></div><canvas id="speedCv"></canvas></div><div id="marks"></div><input id="slider" type="range" min="0" max="1000" value="0" aria-label="Position along the tour"></div>
     <span id="clock"></span>
     <button id="resetBtn" title="Restart (R)" aria-label="Restart"><span class="ic">↺</span><span class="lbl"> Restart</span></button>
+  </div>
+
+  <div id="vtl" aria-label="Tour timeline">
+    <div id="vHot"></div>
+    <div class="vin">
+      <div id="vCap" aria-live="polite"><div id="vCapNum"></div><div id="vCapName"></div></div>
+      <div class="vtop">
+        <button id="vPrev" class="vnav" aria-label="Previous chapter"><svg width="20" height="20" viewBox="0 0 16 16" aria-hidden="true"><path d="M10 3 5 8l5 5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+        <button id="vPlay" aria-label="Play">
+          <svg class="ic-play" width="16" height="16" viewBox="0 0 14 14" aria-hidden="true" style="margin-left:2px"><path d="M2 1.2v11.6L12.2 7z" fill="currentColor"/></svg>
+          <svg class="ic-pause" width="16" height="16" viewBox="0 0 14 14" aria-hidden="true"><rect x="2" y="1.5" width="3.4" height="11" rx="1" fill="currentColor"/><rect x="8.6" y="1.5" width="3.4" height="11" rx="1" fill="currentColor"/></svg>
+        </button>
+        <button id="vNext" class="vnav" aria-label="Next chapter"><svg width="20" height="20" viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3l5 5-5 5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+        <div id="vTrack"><div id="vLine"></div><div id="vFill"></div><div id="vMarks"></div></div>
+        <span id="vClock"></span><span id="vT0" class="vt"></span><span id="vT1" class="vt"></span>
+        <button id="vReset" aria-label="Restart"><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8a5 5 0 1 0 1.6-3.7M3 2.5v3h3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+      </div>
+    </div>
   </div>
 
   <div id="author" hidden>
@@ -233,7 +439,7 @@
     <div class="row"><span><kbd>Alt</kbd> / <kbd>⌘</kbd> + drag a curve handle: one side only</span><span></span></div>
     <div class="row"><span><kbd>K</kbd> erase stray splats</span><span><kbd>`</kbd> hide / show this panel</span></div>
     <div class="sep"></div>
-    <div class="row"><span>Edit path (<kbd>M</kbd>): drag a point to move it</span><span><kbd>⇧</kbd> keeps height</span></div>
+    <div class="row"><span>Edit (<kbd>M</kbd>): drag a point to move it</span><span><kbd>⇧</kbd> keeps height</span></div>
     <div class="row"><span>Double-click the line</span><span>adds a point</span></div>
     <div class="row"><span>Purple ◆ on a selected point</span><span>drag to bend the path</span></div>
     <div class="row"><span><kbd>[</kbd> <kbd>]</kbd> step through points</span><span><kbd>V</kbd> view from it</span></div>
@@ -253,7 +459,7 @@
     <div class="eRow" id="eraseMsg"></div>
   </div>
   <div id="pip" hidden><div class="pipLabel"><span class="pipTitle"></span><button id="pipHide" title="Hide preview" aria-label="Hide preview">–</button></div><div class="pipGrip" title="Drag to resize"></div></div>
-  <button id="pipChip" hidden title="Show the camera preview">▣ Show preview</button>
+  <button id="pipChip" hidden title="Show the camera preview">Show preview</button>
   <div id="flash"></div>
 
   <div id="loader"><div id="pct">0%</div><div class="track"><div id="bar"></div></div></div>
@@ -266,5 +472,56 @@
   } }
   </script>
   <script type="module" src="./main.js"></script>
+<script>
+/* Color tester: open with the Colors button (shows in ?author, or add ?colors to any address). Picks are kept in this browser only. */
+(() => {
+  const q = new URLSearchParams(location.search);
+  if (!q.has("author") && !q.has("colors")) return;
+  const VARS = [
+    ["--ch-now", "Active chapter dot, selected buttons & tabs", "#ffc35c"],
+    ["--ch", "Other chapter dots", "#adadad"],
+    ["--first", "First point", "#5ee08a"],
+    ["--last", "Last point", "#ff4a4a"],
+    ["--fg", "Text", "#f3efe8"],
+    ["--dim", "Dim text", "#b9b3a8"],
+    ["--on-accent", "Text on selected dots & buttons", "#111111"],
+  ];
+  const KEY = "china26-colors", root = document.documentElement;
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(KEY) || "{}"); } catch {}
+  const get = (v, d) => saved[v] || d;
+  const norm = (s) => { s = String(s).trim().replace(/^#?/, "#"); if (/^#[0-9a-f]{3}$/i.test(s)) s = "#" + [...s.slice(1)].map((c) => c + c).join(""); return /^#[0-9a-f]{6}$/i.test(s) ? s.toLowerCase() : null; };
+  const apply = () => { VARS.forEach(([v, , d]) => root.style.setProperty(v, get(v, d))); out(); };
+  const out = () => { $("ctOut").textContent = VARS.map(([v, , d]) => v + ":" + get(v, d) + ";").join(" "); };
+  const $ = (id) => document.getElementById(id);
+  const rows = $("ctRows");
+  VARS.forEach(([v, label, d]) => {
+    const r = document.createElement("div");
+    r.className = "cr";
+    r.innerHTML = '<span>' + label + '<small>' + v + '</small></span><input type="color"><input type="text" maxlength="9" spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off" data-lpignore="true" data-1p-ignore placeholder="#ffffff">';
+    const [cp, tx] = r.querySelectorAll("input");
+    // typing never rewrites the box while you type; the color applies as soon as it is a full 6-digit hex, and 3-digit hex on Enter / leaving the box
+    const set = (val, fixBox) => { const c = norm(val); if (!c) return false; saved[v] = c; cp.value = c; if (fixBox) tx.value = c; try { localStorage.setItem(KEY, JSON.stringify(saved)); } catch {} apply(); return true; };
+    cp.value = tx.value = get(v, d);
+    tx.name = "ct-" + v.slice(2) + "-" + Math.random().toString(36).slice(2, 6); // unique name so the browser has nothing to autofill from
+    cp.addEventListener("input", () => set(cp.value, true));
+    tx.addEventListener("input", () => { if (/^#?[0-9a-f]{6}$/i.test(tx.value.trim())) set(tx.value, false); });
+    tx.addEventListener("keydown", (e) => { e.stopPropagation(); if (e.key === "Enter") { if (!set(tx.value, true)) tx.value = get(v, d); tx.blur(); } });
+    tx.addEventListener("blur", () => { if (!set(tx.value, true)) tx.value = get(v, d); });
+    tx.addEventListener("focus", () => tx.select());
+    r.dataset.v = v;
+    rows.appendChild(r);
+  });
+  $("ctBtn").hidden = false;
+  $("ctBtn").addEventListener("click", () => { $("ctPanel").hidden = !$("ctPanel").hidden; $("ctBtn").classList.toggle("on", !$("ctPanel").hidden); });
+  $("ctReset").addEventListener("click", () => {
+    saved = {}; try { localStorage.removeItem(KEY); } catch {}
+    rows.querySelectorAll(".cr").forEach((r) => { const [v, , d] = VARS.find((x) => x[0] === r.dataset.v); const [cp, tx] = r.querySelectorAll("input"); cp.value = tx.value = d; });
+    apply();
+  });
+  $("ctCopy").addEventListener("click", async () => { try { await navigator.clipboard.writeText($("ctOut").textContent); $("ctCopy").textContent = "Copied"; setTimeout(() => ($("ctCopy").textContent = "Copy values"), 1200); } catch { $("ctCopy").textContent = "Select the text below"; } });
+  apply();
+})();
+</script>
 </body>
 </html>

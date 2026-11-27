@@ -13,15 +13,74 @@ const types = {
   ".ply": "application/octet-stream",
 };
 
+import { bakeFile } from "./bake.mjs";
+const readJ = (f) => { try { return JSON.parse(fs.readFileSync(path.join(root, f), "utf8")); } catch { return null; } };
+const bake = { state: "idle", removed: 0, total: 0, error: "", file: "" };
+let pending = null, baking = false;
+function queueBake(data) { pending = data; if (!baking) runBake(); }
+function runBake() {
+  baking = true;
+  setTimeout(() => {
+    const data = pending; pending = null;
+    try {
+      bake.state = "working"; bake.error = "";
+      const cfg = readJ("config.json") || {};
+      const name = decodeURIComponent(String(cfg.splat || "").split("?")[0].split("/").pop());
+      if (!name.endsWith(".spz") || !fs.existsSync(path.join(root, name))) throw new Error(name + " is not in the site folder");
+      // the splat file is updated in place. The untouched original is kept once as <name>.original.spz, and every update starts from it,
+      // so removing a mark brings those splats back.
+      const orig = name.replace(/\.spz$/, ".original.spz");
+      if (!fs.existsSync(path.join(root, orig))) fs.copyFileSync(path.join(root, name), path.join(root, orig));
+      const r = bakeFile({ src: path.join(root, orig), marks: data.spheres || [], orientation: data.orientation ?? readJ("path.json")?.orientation ?? cfg.orientation ?? 0, out: path.join(root, name) });
+      Object.assign(bake, { state: "done", removed: r.removed, total: r.total, file: name });
+      console.log(`updated ${name}: ${r.removed} splats removed by ${data.spheres.length} marks`);
+    } catch (e) { bake.state = "error"; bake.error = String(e.message || e); console.error("bake failed:", e); }
+    baking = false;
+    if (pending) runBake();
+  }, 50);
+}
+
 http.createServer((req, res) => {
   const url = new URL(req.url, "http://x");
-  // author tool: the Erase panel posts its list of marked spots here; saved as erase.json next to this file
+  // author tool: the Erase panel posts its marks here. They are saved as erase.json and baked into
+  // the splat file (in place) right away. The untouched original is kept as <name>.original.spz.
   if (req.method === "POST" && url.pathname === "/__erase") {
     let body = "";
     req.on("data", (c) => { body += c; if (body.length > 1e6) req.destroy(); });
     req.on("end", () => {
-      try { JSON.parse(body); fs.writeFileSync(path.join(root, "erase.json"), body); res.writeHead(200).end("ok"); }
-      catch { res.writeHead(400).end("bad json"); }
+      try {
+        const data = JSON.parse(body);
+        fs.writeFileSync(path.join(root, "erase.json"), JSON.stringify(data, null, 2));
+        res.writeHead(200).end("ok");
+        queueBake(data);
+      } catch { res.writeHead(400).end("bad json"); }
+    });
+    return;
+  }
+  if (req.method === "GET" && url.pathname === "/__bake-status") {
+    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" }).end(JSON.stringify(bake));
+    return;
+  }
+  // author tool: every edit is written straight to path.json. Only accepted if the file on disk still matches the version the page was built from.
+  if (req.method === "POST" && url.pathname === "/__path") {
+    let body = "";
+    req.on("data", (c) => { body += c; if (body.length > 5e6) req.destroy(); });
+    req.on("end", () => {
+      try {
+        const { base, data } = JSON.parse(body);
+        if (!data || !Array.isArray(data.waypoints)) throw new Error("bad data");
+        const target = path.join(root, "path.json");
+        if (fs.existsSync(target)) {
+          let disk = "";
+          try { disk = JSON.stringify(JSON.parse(fs.readFileSync(target, "utf8"))); } catch {}
+          if (disk && disk !== base) { res.writeHead(409).end("path.json changed on disk"); return; }
+          fs.copyFileSync(target, path.join(root, "path.backup.json"));
+        }
+        const tmp = target + ".tmp";
+        fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n");
+        fs.renameSync(tmp, target);
+        res.writeHead(200).end("ok");
+      } catch { res.writeHead(400).end("bad json"); }
     });
     return;
   }

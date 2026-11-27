@@ -1,0 +1,618 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Fong Ancestral Home · reveal</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #0b0b0c; overflow: hidden; font-family: system-ui, sans-serif; }
+    canvas { display: block; width: 100%; height: 100%; }
+    #hud { position: fixed; left: 16px; bottom: 16px; color: #bbb; font-size: 12px; line-height: 1.6;
+           background: rgba(0,0,0,.45); padding: 10px 12px; border-radius: 8px; user-select: none; }
+    #hud b { color: #fff; font-weight: 600; }
+    #status { position: fixed; inset: 0; display: grid; place-items: center; color: #888; font-size: 13px;
+              pointer-events: none; transition: opacity .6s; text-align: center; padding: 24px; }
+
+    #gear { position: fixed; top: 14px; right: 14px; width: 36px; height: 36px; border-radius: 10px; border: 0;
+            background: rgba(20,20,22,.7); color: #ddd; font-size: 18px; cursor: pointer; backdrop-filter: blur(8px); }
+    #panel { position: fixed; top: 58px; right: 14px; width: 268px; max-height: calc(100% - 80px); overflow: auto;
+             background: rgba(18,18,20,.82); color: #ccc; border-radius: 12px; padding: 12px 14px 14px;
+             font-size: 12px; backdrop-filter: blur(10px); display: none; }
+    #panel.open { display: block; }
+    #panel h4 { margin: 12px 0 6px; font-size: 10px; letter-spacing: .08em; text-transform: uppercase; color: #777; font-weight: 600; }
+    #panel h4:first-child { margin-top: 0; }
+    .row { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 2px 8px; margin: 7px 0; }
+    .row label { color: #bbb; }
+    .row output { color: #fff; font-variant-numeric: tabular-nums; }
+    .row input[type=range] { grid-column: 1 / -1; width: 100%; margin: 0; accent-color: #e8a85a; }
+    .row select, .row input[type=color] { grid-column: 1 / -1; width: 100%; background: #26262a; color: #eee; border: 0;
+             border-radius: 6px; padding: 6px 8px; font-size: 12px; }
+    .row input[type=color] { height: 30px; padding: 2px; }
+    .check { display: flex; align-items: center; gap: 8px; margin: 8px 0; color: #bbb; }
+    .btns { display: flex; gap: 6px; margin-top: 12px; }
+    .btns button { flex: 1; background: #2b2b30; color: #eee; border: 0; border-radius: 6px; padding: 7px 0; font-size: 12px; cursor: pointer; }
+    .btns button:hover { background: #38383e; }
+  </style>
+  <!-- same local copies of three + spark that your main site uses -->
+  <script type="importmap">
+  { "imports": {
+      "three": "./vendor/three.module.js",
+      "three/addons/": "./vendor/addons/",
+      "@sparkjsdev/spark": "./vendor/spark.module.js"
+  } }
+  </script>
+</head>
+<body>
+  <div id="status">loading splat…</div>
+  <div id="hud">
+    <b>R</b> replay the reveal &nbsp; <b>H</b> settings<br />
+    drag to look, WASD to fly
+  </div>
+  <button id="gear" title="Settings (H)">⚙</button>
+  <div id="panel"></div>
+
+<script type="module">
+import * as THREE from "three";
+import { SparkRenderer, SparkControls, SplatMesh, dyno } from "@sparkjsdev/spark";
+
+// ---- defaults (every one of these is also a slider in the ⚙ panel) -------------------------
+const params = new URLSearchParams(location.search);
+const SPLAT_URL = params.get("splat") || "./cleaned-up-splat-v11.spz";
+const ORIENTATION_DEG = [-90, 0, 0];   // same as your site's orientation 3
+const MAX_POINTS = 64;                 // how many places it remembers (compile-time, more = heavier)
+
+const DEFAULTS = {
+  mode: 0,           // 0 = one-time reveal that plays across the whole house · 1 = explore (reveals around you as you move)
+  revealSeconds: 14, // reveal mode: how long the full reveal takes
+  style: 5,          // 0 fade · 1 dissolve · 2 grow · 3 rise · 4 scatter · 5 dots, then fill in
+  easing: 1,         // 0 ease out · 1 ease in-out · 2 linear
+  radius: 11,        // % of the house size (explore mode; also sets edge softness / wobble / travel scale)
+  softness: 0.3,     // edge width, x radius
+  noise: 0.6,        // edge wobble, x radius
+  duration: 1.3,     // explore mode: seconds for one reveal to settle
+  noDelay: 0.3,      // explore mode: one dial that cuts the lag
+  lookahead: 1,      // explore mode: plant reveals this far in front of you, x radius
+  headStart: 0.8,    // explore mode: skip this much of the start of each reveal
+  spacing: 0.2,      // explore mode: distance between reveal points, x radius
+  dotSpacing: 6,     // style 5: the first dots are 1 in N of the splats (sparse skeleton appears first)
+  dotSize: 1.2,      // style 5: dot size
+  fillDelay: 0.25,   // style 5: how far behind the dots the fill follows, as a share of the reveal (0 = right on top of them, instantly final)
+  roundness: 1,      // 0 = splats keep their real (often stretched) shape while appearing · 1 = they appear as round dots
+  motion: 2,         // how far splats travel in "rise" / "scatter", x radius
+  glow: 2.5,         // brightness of the warm edge
+  glowColor: "#ffdf00",
+  look: 0,           // 0 normal · 1 x-ray · 2 silhouette · 3 blueprint · 4 height map · 5 ink on paper · 6 points
+  lookOpacity: 0.18, // x-ray / blueprint: how see-through the building is
+  pointSize: 1,      // points look: dot size
+  pointSpacing: 1,   // points look: 1 = every point, 4 = a quarter of them (sparser, more spread out)
+  pointAuto: true,   // points look: grow the dots as spacing increases so the surface stays covered
+  tintA: "#0a4a7a",  // look colour A (x-ray shadows, silhouette fill, height low ...)
+  tintB: "#bff6ff",  // look colour B (x-ray highlights, height high ...)
+  bg: "#0b0b0c",     // page background
+  all: false,        // show the whole house
+};
+// choosing a look in the panel loads these colours/values (you can still tweak them afterwards)
+const LOOKS = {
+  0: { bg: "#0b0b0c" },
+  1: { tintA: "#0a4a7a", tintB: "#bff6ff", bg: "#04070b", lookOpacity: 0.18 },
+  2: { tintA: "#111114", bg: "#f1eee7" },
+  3: { tintA: "#4f8cff", tintB: "#ffffff", bg: "#0b2a5c", lookOpacity: 0.10 },
+  4: { tintA: "#2b3a8f", tintB: "#ffd36b", bg: "#0b0b0c" },
+  5: { tintA: "#1c1b1a", bg: "#efe9dc" },
+  6: { bg: "#0b0b0c", pointSize: 1, pointSpacing: 1 },
+};
+const LOOK_KEYS = ["look", "lookOpacity", "pointSize", "pointSpacing", "pointAuto", "tintA", "tintB", "bg"];
+// ---------------------------------------------------------------------------------------------
+
+const STORE = "china26-reveal-settings-v8";
+const S = { ...DEFAULTS };
+try { Object.assign(S, JSON.parse(localStorage.getItem(STORE) || "{}")); } catch {}
+if (params.has("all")) S.all = true;
+const save = () => { try { localStorage.setItem(STORE, JSON.stringify(S)); } catch {} };
+
+const status = document.getElementById("status");
+
+const renderer = new THREE.WebGLRenderer({ antialias: false });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.01, 1000);
+scene.add(camera);
+const spark = new SparkRenderer({ renderer });
+scene.add(spark);
+const controls = new SparkControls({ canvas: renderer.domElement });
+
+// ---- stop the camera moving on its own ------------------------------------------------------
+// 1) Spark reads the first connected game controller. Any joystick / wheel / pad whose stick doesn't rest at
+//    exactly zero reads as constant movement, so controllers are ignored (add ?gamepad to the URL to use one).
+if (!params.has("gamepad")) {
+  try { Object.defineProperty(navigator, "getGamepads", { value: () => [], configurable: true }); } catch {}
+}
+// 2) A key whose "released" event never arrives (Alt-Tab, Cmd/Ctrl shortcuts, an open dropdown, a clicked panel)
+//    keeps flying you forever. Clear the pressed-key list in those situations.
+const releaseKeys = () => { const m = controls.fpsMovement; if (m) { m.keycode = {}; m.keydown = {}; } };
+let lastKeyEvent = performance.now();
+addEventListener("blur", releaseKeys);
+document.addEventListener("visibilitychange", releaseKeys);
+document.addEventListener("pointerdown", (e) => { if (e.target.closest?.("#panel,#gear")) releaseKeys(); }, true);
+document.addEventListener("keydown", (e) => {
+  lastKeyEvent = performance.now();
+  if (e.ctrlKey || e.metaKey || e.altKey || e.target.closest?.("input,select,textarea")) setTimeout(releaseKeys, 0);
+}, true);
+document.addEventListener("keyup", (e) => {
+  lastKeyEvent = performance.now();
+  if (e.key === "Meta" || e.key === "Control" || e.key === "Alt") releaseKeys();
+}, true);
+
+// ---- shader uniforms ----------------------------------------------------------------------
+// each reveal point: xyz = where you were (splat-file space), w = when it was dropped
+const FAR_PAST = -1e6;
+const uNow    = dyno.dynoFloat(0);
+const uSpeed  = dyno.dynoFloat(1);   // 1 / duration
+const uR      = dyno.dynoFloat(1);
+const uBand   = dyno.dynoFloat(0.3);
+const uJitter = dyno.dynoFloat(0.1);
+const uGlowAmt= dyno.dynoFloat(1);
+const uMotion = dyno.dynoFloat(0);
+const uHead   = dyno.dynoFloat(0);
+const uRound  = dyno.dynoFloat(1);
+const uLook   = dyno.dynoInt(0);
+const uLookOp = dyno.dynoFloat(0.2);
+const uPointSz= dyno.dynoFloat(0.01);
+const uPointKeep = dyno.dynoFloat(1);
+const uDotKeep = dyno.dynoFloat(0.2);
+const uCam    = dyno.dynoVec3(new THREE.Vector3());
+const uFillStart = dyno.dynoFloat(0.4);
+const uDotSz  = dyno.dynoFloat(0.01);
+const uHMin   = dyno.dynoFloat(0);
+const uHSpan  = dyno.dynoFloat(1);
+const uTA     = dyno.dynoVec3(new THREE.Vector3(0, 0, 1));
+const uTB     = dyno.dynoVec3(new THREE.Vector3(1, 1, 1));
+const uStyle  = dyno.dynoInt(0);
+const uEase   = dyno.dynoInt(0);
+const uAll    = dyno.dynoInt(0);
+const uGlow   = dyno.dynoVec3(new THREE.Vector3(1, 0.72, 0.4));
+const uUp     = dyno.dynoVec3(new THREE.Vector3(0, 1, 0));
+const uPts    = Array.from({ length: MAX_POINTS }, () => dyno.dynoVec4(new THREE.Vector4(0, 0, 0, FAR_PAST)));
+
+const inTypes = { gsplat: dyno.Gsplat, now: "float", speed: "float", R: "float", band: "float", jitter: "float",
+                  glowAmt: "float", motion: "float", head: "float", round: "float", look: "int", lookOp: "float", pointSz: "float", pointKeep: "float", dotKeep: "float", cam: "vec3", fillStart: "float", dotSz: "float", hMin: "float", hSpan: "float", tA: "vec3", tB: "vec3", style: "int", ease: "int", all: "int", glow: "vec3", up: "vec3" };
+uPts.forEach((_, i) => { inTypes["p" + i] = "vec4"; });
+
+const revealShader = new dyno.Dyno({
+  inTypes,
+  outTypes: { gsplat: dyno.Gsplat },
+  globals: () => [
+    dyno.unindent(`
+      float hash13(vec3 p) {
+        p = fract(p * 0.1031);
+        p += dot(p, p.zyx + 31.32);
+        return fract((p.x + p.y) * p.z);
+      }
+      float easeSel(float a, int m) {
+        if (m == 0) return 1.0 - pow(1.0 - a, 3.0);
+        if (m == 1) return a * a * (3.0 - 2.0 * a);
+        return a;
+      }
+    `),
+  ],
+  statements: ({ inputs, outputs }) => {
+    const loop = uPts.map((_, i) => `
+      {
+        vec4 s = ${inputs["p" + i]};
+        if (s.w > -1.0e5) {
+          float a = clamp((${inputs.now} - s.w) * ${inputs.speed} + ${inputs.head}, 0.0, 1.0);
+          float e;
+          if (${inputs.ease} == 0)      { e = 1.0 - pow(1.0 - a, 3.0); }          // ease out
+          else if (${inputs.ease} == 1) { e = a * a * (3.0 - 2.0 * a); }          // ease in-out
+          else                          { e = a; }                                // linear
+          float front = e * (${inputs.R} + ${inputs.band});
+          float hi = smoothstep(front - ${inputs.band}, front, distance(c, s.xyz) + n * ${inputs.jitter});
+          h = min(h, hi);
+          if (${inputs.style} == 5) {
+            float aD = clamp(a / max(1.0 - ${inputs.fillStart}, 0.01), 0.0, 1.0);                                     // dots wave
+            float aF = clamp((a - ${inputs.fillStart}) / max(1.0 - ${inputs.fillStart}, 0.01), 0.0, 1.0);  // fill wave: same speed, starts later (0 = right on top of the dots)
+            float fD = easeSel(aD, ${inputs.ease}) * (${inputs.R} + ${inputs.band});
+            float fF = easeSel(aF, ${inputs.ease}) * (${inputs.R} + ${inputs.band});
+            float dd = distance(c, s.xyz) + n * ${inputs.jitter};
+            hD = min(hD, smoothstep(fD - ${inputs.band}, fD, dd));
+            hF = min(hF, smoothstep(fF - ${inputs.band}, fF, dd));
+          }
+        }
+      }`).join("\n");
+    return dyno.unindentLines(`
+      ${outputs.gsplat} = ${inputs.gsplat};
+      vec3 c = ${inputs.gsplat}.center;
+      float n = hash13(c * 4.0);
+      float h = 1.0;
+      float hD = 1.0;
+      float hF = 1.0;
+      ${loop}
+      if (${inputs.style} == 5) { h = hD; }        // style 5: visibility follows the dots wave
+      h = h * h * (3.0 - 2.0 * h);               // smooth the edge a second time
+      float hFs = hF * hF * (3.0 - 2.0 * hF);
+      if (${inputs.all} == 1) { h = 0.0; hFs = 0.0; }
+
+      if (h >= 0.995) {
+        ${outputs.gsplat}.scales = vec3(0.0);
+        ${outputs.gsplat}.rgba.a = 0.0;
+      } else {
+        float k = 1.0 - h;                        // 0 = just starting, 1 = fully revealed
+        // Splats are usually stretched ellipsoids. Shrunk on their own they read as sticks/needles, so
+        // while appearing, blend from a round dot (sized from the short axes) into the real shape.
+        {
+          vec3 sc = ${outputs.gsplat}.scales;
+          float mx = max(max(sc.x, sc.y), sc.z);
+          float m = 0.5 * (sc.x + sc.y + sc.z - mx) + 0.15 * mx;
+          vec3 rounded = mix(vec3(m), sc, smoothstep(0.0, 1.0, k));
+          ${outputs.gsplat}.scales = mix(sc, rounded, ${inputs.round});
+        }
+        if (${inputs.style} == 0) {               // FADE: mostly a slow fade
+          ${outputs.gsplat}.scales *= 0.55 + 0.45 * k;
+          ${outputs.gsplat}.rgba.a *= smoothstep(0.0, 0.6, k);
+        } else if (${inputs.style} == 1) {        // DISSOLVE: splats pop in one by one, in random order
+          float vis = smoothstep(n * 0.8, n * 0.8 + 0.2, k);
+          ${outputs.gsplat}.scales *= 0.35 + 0.65 * vis;
+          ${outputs.gsplat}.rgba.a *= vis;
+        } else if (${inputs.style} == 2) {        // GROW: splats swell from tiny points
+          ${outputs.gsplat}.scales *= k;
+          ${outputs.gsplat}.rgba.a *= smoothstep(0.0, 0.35, k);
+        } else if (${inputs.style} == 3) {        // RISE: splats float up into place from below
+          ${outputs.gsplat}.center -= ${inputs.up} * (${inputs.motion} * h);
+          ${outputs.gsplat}.rgba.a *= smoothstep(0.0, 0.6, k);
+        } else if (${inputs.style} == 5) {        // DOTS, THEN FILL: a sparse skeleton of round dots washes over the whole house, then a second wave fills it in
+          vec3 s0d = ${inputs.gsplat}.scales;
+          float a0d = ${inputs.gsplat}.rgba.a;
+          float isDot = step(hash13(c * 13.7 + 3.1), ${inputs.dotKeep});
+          float fillT = 1.0 - hFs;                                                   // 0 = still a dot, 1 = filled in
+          float dotA = smoothstep(0.05, 0.3, a0d) * k * isDot;                       // k = how far the dots wave has got
+          ${outputs.gsplat}.rgba.a = mix(dotA, a0d, fillT);
+          // grow short axes first and the long axis last, so a splat goes dot -> disc -> full stretch and never looks like a stick
+          float mxd = max(max(s0d.x, s0d.y), s0d.z);
+          float mnd = min(min(s0d.x, s0d.y), s0d.z);
+          float tEarly = smoothstep(0.0, 0.6, fillT);
+          float tMid   = smoothstep(0.2, 0.8, fillT);
+          float tLate  = smoothstep(0.45, 1.0, fillT);
+          vec3 tt = vec3(s0d.x >= mxd ? tLate : (s0d.x <= mnd ? tEarly : tMid),
+                         s0d.y >= mxd ? tLate : (s0d.y <= mnd ? tEarly : tMid),
+                         s0d.z >= mxd ? tLate : (s0d.z <= mnd ? tEarly : tMid));
+          float dsz = ${inputs.dotSz} * distance(c, ${inputs.cam});   // dots stay the same size on screen, near or far
+          ${outputs.gsplat}.scales = mix(vec3(dsz), s0d, tt);
+        } else {                                  // SCATTER: splats drift in from random directions
+          vec3 dir = vec3(hash13(c * 7.1), hash13(c * 3.7 + 1.0), hash13(c * 5.3 + 2.0)) - 0.5;
+          ${outputs.gsplat}.center += dir * 2.0 * ${inputs.motion} * h;
+          ${outputs.gsplat}.rgba.a *= smoothstep(0.0, 0.6, k);
+        }
+        if (${inputs.look} != 0) {
+          vec4 q = ${outputs.gsplat}.rgba;
+          float a0 = ${inputs.gsplat}.rgba.a;                     // the splat's original opacity
+          float ratio = clamp(q.a / max(a0, 1.0e-4), 0.0, 1.0);   // how far through the reveal this splat is
+          float lum = dot(q.rgb, vec3(0.299, 0.587, 0.114));
+          vec3 s0 = ${inputs.gsplat}.scales;
+          float mx2 = max(max(s0.x, s0.y), s0.z);
+          float mn2 = min(min(s0.x, s0.y), s0.z);
+          float edge = smoothstep(2.0, 8.0, mx2 / max(mn2, 1.0e-6));   // stretched splats = edges / surfaces
+          if (${inputs.look} == 1) {                // X-RAY: see-through, cool tint by brightness
+            q.rgb = mix(${inputs.tA}, ${inputs.tB}, smoothstep(0.1, 0.9, lum));
+            q.a *= ${inputs.lookOp};
+          } else if (${inputs.look} == 2) {         // SILHOUETTE: flat solid shape
+            q.rgb = ${inputs.tA};
+            q.a = smoothstep(0.03, 0.25, a0) * ratio;
+            ${outputs.gsplat}.scales = s0 * 1.25;
+          } else if (${inputs.look} == 3) {         // BLUEPRINT: faint body, bright edges
+            q.rgb = mix(${inputs.tA}, ${inputs.tB}, edge);
+            q.a *= mix(${inputs.lookOp}, 1.0, edge);
+          } else if (${inputs.look} == 4) {         // HEIGHT MAP: colour by height
+            float ht = clamp((dot(c, ${inputs.up}) - ${inputs.hMin}) / max(${inputs.hSpan}, 1.0e-4), 0.0, 1.0);
+            q.rgb = mix(${inputs.tA}, ${inputs.tB}, ht) * (0.45 + 0.9 * lum);
+          } else if (${inputs.look} == 5) {         // INK ON PAPER
+            q.rgb = ${inputs.tA} * (0.35 + 0.65 * lum);
+            q.a *= 0.9;
+          } else {                                   // POINTS: every splat becomes a small round dot
+            float keep = step(hash13(c * 13.7 + 3.1), ${inputs.pointKeep});   // thin the cloud: keep 1 in N points
+            q.a = smoothstep(0.05, 0.3, a0) * ratio * keep;
+            ${outputs.gsplat}.scales = vec3(${inputs.pointSz} * (0.3 + 0.7 * ratio));
+          }
+          ${outputs.gsplat}.rgba = q;
+        }
+        ${outputs.gsplat}.rgba.rgb += ${inputs.glow} * (h * (1.0 - h) * 4.0 * ${inputs.glowAmt});
+      }
+    `);
+  },
+});
+
+// ---- state --------------------------------------------------------------------------------
+let mesh, diag = 10, radius = 1, spacing = 0.3, reach = 1, modifierOn = false;
+const boxLo = new THREE.Vector3(), boxHi = new THREE.Vector3();
+const meshQ = new THREE.Quaternion().setFromEuler(new THREE.Euler(
+  THREE.MathUtils.degToRad(ORIENTATION_DEG[0]), THREE.MathUtils.degToRad(ORIENTATION_DEG[1]),
+  THREE.MathUtils.degToRad(ORIENTATION_DEG[2]), "XYZ"));
+const meshQinv = meshQ.clone().invert();
+
+const points = [];            // { pos: Vector3, t: number }
+const camObj = new THREE.Vector3();
+const fwd = new THREE.Vector3();
+function aheadPos() {
+  // a point in front of the camera (splat-file space), so the reveal is already under way where you're heading
+  fwd.set(0, 0, -1).applyQuaternion(camera.quaternion).applyQuaternion(meshQinv);
+  return camObj.clone().addScaledVector(fwd, radius * (S.lookahead + 1.5 * S.noDelay));
+}
+const lastDrop = new THREE.Vector3(Infinity, Infinity, Infinity);
+let t0 = performance.now() / 1000, dirtyUntil = 0;
+const nowSec = () => performance.now() / 1000 - t0;
+
+function applySettings() {
+  radius = diag * S.radius / 100;
+  spacing = Math.max(radius * S.spacing * (1 - 0.6 * S.noDelay), diag * 0.0004);   // 0 = continuous: a new point as soon as you move
+  const reveal = S.mode === 0;
+  uR.value = reveal ? reach : radius;
+  uBand.value = radius * S.softness;
+  uJitter.value = radius * S.noise;
+  uSpeed.value = 1 / (reveal ? S.revealSeconds : S.duration);
+  uMotion.value = radius * S.motion;
+  uRound.value = S.roundness;
+  uLook.value = S.look;
+  uLookOp.value = S.lookOpacity;
+  uPointSz.value = diag * 0.0012 * S.pointSize * (S.pointAuto ? Math.sqrt(S.pointSpacing) : 1);
+  uPointKeep.value = 1 / S.pointSpacing;
+  uDotKeep.value = 1 / S.dotSpacing;
+  uDotSz.value = 0.002 * S.dotSize;   // x distance from the camera = a constant size on screen
+  uFillStart.value = Math.min(0.9, S.fillDelay);
+  { const a = new THREE.Color(S.tintA), b = new THREE.Color(S.tintB);
+    uTA.value.set(a.r, a.g, a.b); uTB.value.set(b.r, b.g, b.b); }
+  renderer.setClearColor(new THREE.Color(S.bg), 1);
+  uHead.value = reveal ? 0 : Math.min(0.9, S.headStart + 0.4 * S.noDelay);
+  uGlowAmt.value = S.glow;
+  uStyle.value = S.style;
+  uEase.value = S.easing;
+  uAll.value = S.all ? 1 : 0;
+  const c = new THREE.Color(S.glowColor);
+  uGlow.value.set(c.r, c.g, c.b);
+}
+
+function writeUniforms() {
+  uPts.forEach((u, i) => {
+    const p = points[i];
+    if (p) u.value.set(p.pos.x, p.pos.y, p.pos.z, p.t);
+    else u.value.set(0, 0, 0, FAR_PAST);
+  });
+}
+
+function dropPoint(pos, now) {
+  if (points.length >= MAX_POINTS) {
+    // evict the most redundant point (the one with the closest neighbour)
+    let worst = 0, worstD = Infinity;
+    for (let i = 0; i < points.length; i++) {
+      let nearest = Infinity;
+      for (let j = 0; j < points.length; j++) if (i !== j) nearest = Math.min(nearest, points[i].pos.distanceTo(points[j].pos));
+      if (nearest < worstD) { worstD = nearest; worst = i; }
+    }
+    points.splice(worst, 1);
+  }
+  points.push({ pos: pos.clone(), t: now });
+  lastDrop.copy(pos);
+  writeUniforms();
+  dirtyUntil = now + (S.mode === 0 ? S.revealSeconds : S.duration) + 0.2;
+}
+
+function attachModifier() {
+  mesh.objectModifier = dyno.dynoBlock({ gsplat: dyno.Gsplat }, { gsplat: dyno.Gsplat }, ({ gsplat }) => {
+    const args = { gsplat, now: uNow, speed: uSpeed, R: uR, band: uBand, jitter: uJitter, glowAmt: uGlowAmt,
+                   motion: uMotion, head: uHead, round: uRound, look: uLook, lookOp: uLookOp, pointSz: uPointSz, pointKeep: uPointKeep, dotKeep: uDotKeep, cam: uCam, fillStart: uFillStart, dotSz: uDotSz, hMin: uHMin, hSpan: uHSpan, tA: uTA, tB: uTB, style: uStyle, ease: uEase, all: uAll, glow: uGlow, up: uUp };
+    uPts.forEach((u, i) => { args["p" + i] = u; });
+    return { gsplat: revealShader.apply(args).gsplat };
+  });
+  mesh.updateGenerator();
+  modifierOn = true;
+}
+
+function computeReach() {
+  // farthest corner of the house from where you're standing, with margin, so one reveal covers everything
+  let far = 0;
+  for (const x of [boxLo.x, boxHi.x]) for (const y of [boxLo.y, boxHi.y]) for (const z of [boxLo.z, boxHi.z])
+    far = Math.max(far, camObj.distanceTo(new THREE.Vector3(x, y, z)));
+  reach = far * 1.08;
+}
+
+function startOver() {
+  points.length = 0;
+  lastDrop.set(Infinity, Infinity, Infinity);
+  t0 = performance.now() / 1000;
+  camObj.copy(camera.position).applyQuaternion(meshQinv);
+  computeReach();
+  applySettings();
+  if (!modifierOn) attachModifier();
+  if (S.mode === 1) dropPoint(aheadPos(), 0);
+  dropPoint(camObj, 0);
+  mesh.updateVersion();
+}
+
+// ---- settings panel -----------------------------------------------------------------------
+function buildPanel() {
+  const panel = document.getElementById("panel");
+  const gear = document.getElementById("gear");
+  const toggle = () => panel.classList.toggle("open");
+  gear.onclick = toggle;
+  addEventListener("keydown", (e) => { if (e.key === "h" || e.key === "H") toggle(); });
+
+  let replayTimer = 0;
+  const changed = (key) => {
+    applySettings(); save();
+    if (!mesh) return;
+    if (LOOK_KEYS.includes(key)) { if (!modifierOn) attachModifier(); mesh.updateVersion(); return; }
+    if (S.mode === 0) { clearTimeout(replayTimer); replayTimer = setTimeout(startOver, 250); }   // reveal mode: replay so you see the change
+    else { dirtyUntil = Math.max(dirtyUntil, nowSec() + 0.3); mesh.updateVersion(); }
+  };
+  let html = "";
+  const slider = (key, label, min, max, step) =>
+    `<div class="row"><label for="s_${key}">${label}</label><output id="o_${key}"></output>
+     <input id="s_${key}" type="range" min="${min}" max="${max}" step="${step}"></div>`;
+  const select = (key, label, opts) =>
+    `<div class="row"><label for="s_${key}">${label}</label>
+     <select id="s_${key}">${opts.map((o, i) => `<option value="${i}">${o}</option>`).join("")}</select></div>`;
+
+  html += `<h4>Look</h4>` + select("look", "Render mode", ["Normal", "X-ray", "Silhouette", "Blueprint", "Height map", "Ink on paper", "Points"])
+        + slider("lookOpacity", "See-through (x-ray / blueprint)", 0.02, 1, 0.01) + slider("pointSize", "Point size", 0.2, 6, 0.05) + slider("pointSpacing", "Point spacing", 1, 16, 0.5)
+        + `<label class="check"><input id="s_pointAuto" type="checkbox"> Auto-size dots to spacing</label>`
+        + `<div class="row"><label for="s_tintA">Colour A</label><input id="s_tintA" type="color"></div>`
+        + `<div class="row"><label for="s_tintB">Colour B</label><input id="s_tintB" type="color"></div>`
+        + `<div class="row"><label for="s_bg">Background</label><input id="s_bg" type="color"></div>`;
+  html += `<h4>Mode</h4>` + select("mode", "Reveal type", ["Reveal (plays once, whole house)", "Explore (reveals around you)"])
+        + slider("revealSeconds", "Reveal duration", 2, 30, 0.5) + `<h4>Style</h4>` + select("style", "Reveal style", ["Fade", "Dissolve (random pop-in)", "Grow from points", "Rise up into place", "Scatter in", "Dots, then fill in"]);
+  html += select("easing", "Easing", ["Ease out", "Ease in-out", "Linear"]);
+  html += `<h4>Dots, then fill in</h4>` + slider("dotSpacing", "Dot spacing", 1, 30, 0.5) + slider("dotSize", "Dot size", 0.2, 6, 0.05) + slider("fillDelay", "Fill lag behind dots", 0, 0.8, 0.01);
+  html += `<h4>Size, timing &amp; explore-mode</h4>`;
+  html += slider("noDelay", "No-delay boost", 0, 1, 0.05) + slider("radius", "Reveal radius", 1, 30, 0.5) + slider("softness", "Edge softness", 0.1, 1.5, 0.05)
+        + slider("noise", "Edge wobble", 0, 0.6, 0.01) + slider("duration", "Duration", 0.5, 8, 0.1)
+        + slider("spacing", "Reveal spacing", 0, 1.5, 0.05)
+        + slider("lookahead", "Look-ahead", 0, 3, 0.05) + slider("headStart", "Head start", 0, 0.8, 0.05);
+  html += `<h4>Shape</h4>` + slider("roundness", "Round dots while appearing", 0, 1, 0.05)
+        + `<h4>Motion (rise / scatter)</h4>` + slider("motion", "Travel distance", 0, 2, 0.05);
+  html += `<h4>Glow</h4>` + slider("glow", "Glow strength", 0, 2.5, 0.05)
+        + `<div class="row"><label for="s_glowColor">Glow colour</label><input id="s_glowColor" type="color"></div>`;
+  html += `<h4>Debug</h4><label class="check"><input id="s_all" type="checkbox"> Show the whole house</label>`;
+  html += `<div class="btns"><button id="b_restart">Start over</button><button id="b_reset">Reset</button><button id="b_copy">Copy</button></div>`;
+  panel.innerHTML = html;
+
+  const fmt = { radius: (v) => (+v).toFixed(1) + "%", duration: (v) => (+v).toFixed(1) + "s", revealSeconds: (v) => (+v).toFixed(1) + "s", pointSpacing: (v) => "1 in " + (+v).toFixed(1), dotSpacing: (v) => "1 in " + (+v).toFixed(1) };
+  const label = (key) => (fmt[key] || ((v) => (+v).toFixed(2)))(S[key]);
+  const sync = () => {
+    for (const key of Object.keys(DEFAULTS)) {
+      const el = document.getElementById("s_" + key);
+      if (!el) continue;
+      if (el.type === "checkbox") el.checked = !!S[key]; else el.value = S[key];
+      const o = document.getElementById("o_" + key);
+      if (o) o.textContent = label(key);
+    }
+  };
+  for (const key of Object.keys(DEFAULTS)) {
+    const el = document.getElementById("s_" + key);
+    if (!el) continue;
+    el.addEventListener("input", () => {
+      S[key] = el.type === "checkbox" ? el.checked : el.type === "color" ? el.value : +el.value;
+      const o = document.getElementById("o_" + key);
+      if (o) o.textContent = label(key);
+      if (key === "look") { Object.assign(S, LOOKS[S.look] || {}); sync(); }
+      changed(key);
+    });
+    // give the keyboard back to WASD as soon as a control is let go of
+    el.addEventListener("change", () => el.blur());
+  }
+  document.getElementById("b_restart").onclick = () => { startOver(); document.activeElement?.blur(); };
+  document.getElementById("b_reset").onclick = () => { Object.assign(S, DEFAULTS); sync(); changed(); startOver(); document.activeElement?.blur(); };
+  document.getElementById("b_copy").onclick = async (ev) => {
+    try { await navigator.clipboard.writeText(JSON.stringify(S, null, 2)); ev.target.textContent = "Copied"; }
+    catch { ev.target.textContent = "Copy failed"; }
+    setTimeout(() => (ev.target.textContent = "Copy"), 1200);
+    document.activeElement?.blur();
+  };
+  sync();
+}
+buildPanel();
+
+// ---- load ---------------------------------------------------------------------------------
+async function load() {
+  // authored start of your fly-through (world coordinates)
+  let start = { p: [0, 1.5, 0], q: [0, 0, 0, 1] };
+  try {
+    const pd = await (await fetch("./path.json", { cache: "no-store" })).json();
+    if (pd.waypoints?.length) start = pd.waypoints[0];
+  } catch {}
+  camera.position.set(...start.p);
+  camera.quaternion.set(...start.q);
+
+  mesh = new SplatMesh({
+    url: SPLAT_URL,
+    onProgress: (e) => {
+      if (e?.total) status.textContent = "loading splat… " + Math.round((e.loaded / e.total) * 100) + "%";
+    },
+  });
+  mesh.quaternion.copy(meshQ);
+  scene.add(mesh);
+  await mesh.initialized;
+
+  // robust (percentile) size of the house so floaters don't skew it
+  const xs = [], ys = [], zs = [];
+  const stride = Math.max(1, Math.floor(mesh.numSplats / 60000));
+  const fLo = new THREE.Vector3(Infinity, Infinity, Infinity), fHi = new THREE.Vector3(-Infinity, -Infinity, -Infinity);
+  mesh.forEachSplat((i, c, s, q, o) => {
+    fLo.min(c); fHi.max(c);
+    if (i % stride === 0 && o > 0.3) { xs.push(c.x); ys.push(c.y); zs.push(c.z); }
+  });
+  const pct = (a, f) => { a.sort((p, q) => p - q); return a[Math.floor(f * (a.length - 1))]; };
+  const lo = new THREE.Vector3(pct(xs, 0.05), pct(ys, 0.05), pct(zs, 0.05));
+  const hi = new THREE.Vector3(pct(xs, 0.95), pct(ys, 0.95), pct(zs, 0.95));
+  boxLo.copy(fLo); boxHi.copy(fHi);   // full extent: the reveal wave must reach every splat
+  diag = hi.clone().sub(lo).length() || 10;
+
+  uUp.value.copy(new THREE.Vector3(0, 1, 0).applyQuaternion(meshQinv));   // world "up" in the splat file's space
+  {
+    let hmin = Infinity, hmax = -Infinity;
+    for (const x of [lo.x, hi.x]) for (const y of [lo.y, hi.y]) for (const z of [lo.z, hi.z]) {
+      const d = new THREE.Vector3(x, y, z).dot(uUp.value);
+      hmin = Math.min(hmin, d); hmax = Math.max(hmax, d);
+    }
+    uHMin.value = hmin; uHSpan.value = hmax - hmin;
+  }
+  applySettings();
+
+  camera.near = Math.max(diag * 0.0003, 0.001);
+  camera.far = diag * 20;
+  camera.updateProjectionMatrix();
+
+  attachModifier();
+  status.style.opacity = 0;
+  startOver();
+}
+
+addEventListener("keydown", (e) => {
+  if (mesh && (e.key === "r" || e.key === "R")) startOver();
+});
+
+addEventListener("resize", () => {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+});
+
+renderer.setAnimationLoop(() => {
+  // safety net: a held key keeps sending repeat events, so if keys look pressed but nothing has arrived for 2.5s, they're stuck
+  if (performance.now() - lastKeyEvent > 2500 && Object.values(controls.fpsMovement?.keycode || {}).some(Boolean)) releaseKeys();
+  controls.update(camera);
+
+  if (mesh && mesh.numSplats) {
+    const now = nowSec();
+    camObj.copy(camera.position).applyQuaternion(meshQinv);
+    uCam.value.copy(camObj);
+
+    // moved far enough from the last reveal point: plant a new one here
+    if (S.mode === 1 && points.length) {
+      const ahead = aheadPos();
+      if (ahead.distanceTo(lastDrop) > spacing) dropPoint(ahead, now);
+    }
+
+    // re-run the splat shader every frame while something is blooming (smooth motion), never when idle
+    if (now < dirtyUntil) {
+      uNow.value = now;
+      mesh.updateVersion();
+    } else if (S.mode === 0 && !S.all && S.look === 0 && modifierOn) {
+      // reveal finished: remove the effect so the scene runs at full speed
+      mesh.objectModifier = undefined;
+      mesh.updateGenerator();
+      modifierOn = false;
+    }
+  }
+
+  renderer.render(scene, camera);
+});
+
+load().catch((err) => {
+  status.style.opacity = 1;
+  status.textContent = "couldn't load " + SPLAT_URL + " — open the console (F12) for details";
+  console.error(err);
+});
+</script>
+</body>
+</html>

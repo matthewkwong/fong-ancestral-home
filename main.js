@@ -22,7 +22,15 @@ async function fetchJSON(url, fallback) {
 }
 
 const cfg = await fetchJSON("./config.json", {});
-const SPLAT_URL = params.get("splat") || cfg.splat || "scene.sog";
+let SPLAT_URL = params.get("splat") || cfg.splat || "scene.sog";
+// Testing on your own computer: use the splat file in the site folder instead of downloading it from R2 every time (add ?remote to force R2)
+if (/^(localhost|127\.0\.0\.1)$/.test(location.hostname) && /^https?:/.test(SPLAT_URL) && !params.has("remote")) {
+  const local = "./" + decodeURIComponent(SPLAT_URL.split("?")[0].split("/").pop());
+  try {
+    const r = await fetch(local, { method: "HEAD", cache: "no-store" });
+    if (r.ok && +(r.headers.get("content-length") || 1) > 1e6) SPLAT_URL = local;
+  } catch {}
+}
 $("title").textContent = cfg.title || "";
 document.title = cfg.title || "Fly-through";
 
@@ -48,7 +56,7 @@ let pathData = null;
 // path.json is the source of truth. In author mode, edits are also kept as a draft in this browser so a refresh doesn't lose them,
 // but a draft is only used while it still builds on the current path.json; replace path.json and the stale draft is dropped.
 const fileJSON = await fetchJSON("./path.json", null);
-const fileSig = fileJSON ? JSON.stringify(fileJSON) : "";
+let fileSig = fileJSON ? JSON.stringify(fileJSON) : "";
 if (AUTHOR) {
   try {
     if (localStorage.getItem(STORE_KEY + ":base") === fileSig) pathData = JSON.parse(localStorage.getItem(STORE_KEY) || "null");
@@ -56,6 +64,7 @@ if (AUTHOR) {
 }
 if (!pathData) pathData = fileJSON;
 if (!pathData) pathData = { orientation: cfg.orientation ?? 3, duration: cfg.duration ?? 90, waypoints: [] };
+delete pathData.erase; // erase marks are not stored in path.json (they live in erase.json and are baked into the splat)
 pathData.waypoints ??= [];
 pathData.duration ??= cfg.duration ?? 90;
 pathData.orientation ??= cfg.orientation ?? 3;
@@ -76,6 +85,32 @@ function persist() {
     localStorage.setItem(STORE_KEY, JSON.stringify(pathData));
     localStorage.setItem(STORE_KEY + ":base", fileSig);
   } catch {}
+  scheduleDiskSave();
+}
+// Author on your own computer: every change is also written straight to path.json in the site folder (by serve.mjs), so there is no
+// Export step. The server only writes if path.json on disk is still the version this page was built from, so an old tab can't overwrite it.
+const IS_LOCAL = /^(localhost|127\.0\.0\.1)$/.test(location.hostname);
+let diskTimer = 0, diskOK = true, diskNote = "";
+function scheduleDiskSave() {
+  if (!AUTHOR || !IS_LOCAL || !diskOK) return;
+  clearTimeout(diskTimer);
+  diskTimer = setTimeout(diskSave, 600);
+}
+async function diskSave() {
+  try {
+    const r = await fetch("/__path", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ base: fileSig, data: pathData }) });
+    if (r.status === 409) {
+      diskOK = false;
+      return hudFlash("path.json on disk is different from this page · reload (Ctrl+Shift+R) before editing · auto-save paused");
+    }
+    if (!r.ok) throw new Error(r.status);
+    fileSig = JSON.stringify(JSON.parse(JSON.stringify(pathData)));
+    try { localStorage.setItem(STORE_KEY + ":base", fileSig); } catch {}
+    if (!diskNote) { diskNote = "1"; hudFlash("Auto-saving to path.json"); }
+  } catch {
+    diskOK = false;
+    hudFlash("Auto-save needs the updated server · close and re-run start-author.bat");
+  }
 }
 function save() {
   if (!AUTHOR) return;
@@ -106,9 +141,16 @@ if (AUTHOR) record();
  * ------------------------------------------------------------------ */
 const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: "high-performance" });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-renderer.setSize(window.innerWidth, window.innerHeight);
 document.body.prepend(renderer.domElement);
 const canvas = renderer.domElement;
+// The canvas fills the screen through CSS (position:fixed; inset:0). Its drawing buffer follows that box, not window.innerHeight,
+// which on iPhone Safari is shorter than the fixed-position area while the toolbars are showing and left a black band at the bottom.
+const fitCanvas = () => {
+  const w = canvas.clientWidth || window.innerWidth, h = canvas.clientHeight || window.innerHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h; camera.updateProjectionMatrix();
+};
+renderer.setSize(canvas.clientWidth || window.innerWidth, canvas.clientHeight || window.innerHeight, false);
 renderer.autoClear = false;
 
 const scene = new THREE.Scene();
@@ -278,6 +320,135 @@ function buildFloor() {
   }
 }
 
+/* ------------------------------------------------------------------ *
+ *  Walls: a top-down map of where the splats are dense at head height, so free roam slides along walls instead of passing through
+ * ------------------------------------------------------------------ */
+const WALLS = { on: false, // wall collision is switched off for now (set on: true here, and unhide #colBtn / the B key below, to bring it back)
+  radius: 0.15, minDy: 0.35, maxDy: 1.9, cell: 0.1, need: 3, carve: 1.3,
+  // doorways to keep open: [x, z, radius] in world metres (the x / z shown in the author HUD)
+  openings: [[6.1, 2.0, 1.2]] };
+let wallGrid = null;
+function buildWalls() {
+  wallGrid = null;
+  if (!floorGrid) return;
+  try {
+    const cs = WALLS.cell, stride = Math.max(1, Math.floor(mesh.numSplats / 600000));
+    const counts = new Map();
+    const v = new THREE.Vector3();
+    let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+    mesh.forEachSplat((i, c, sc, q, o) => {
+      if (i % stride !== 0 || o < 0.35) return;
+      v.copy(c).applyQuaternion(mesh.quaternion);
+      const dy = v.y - floorAt(v.x, v.z);
+      if (dy < WALLS.minDy || dy > WALLS.maxDy) return;
+      const ix = Math.floor(v.x / cs), iz = Math.floor(v.z / cs), key = ix + "," + iz;
+      counts.set(key, (counts.get(key) || 0) + 1);
+      minX = Math.min(minX, ix); maxX = Math.max(maxX, ix); minZ = Math.min(minZ, iz); maxZ = Math.max(maxZ, iz);
+    });
+    if (!counts.size) return;
+    const w = maxX - minX + 1, h = maxZ - minZ + 1;
+    if (w * h > 6e6) return;
+    const solid = new Uint8Array(w * h);
+    for (const [key, n] of counts) {
+      if (n < WALLS.need) continue;
+      const [ix, iz] = key.split(",").map(Number);
+      solid[(iz - minZ) * w + (ix - minX)] = 1;
+    }
+    // close small gaps: a cell is solid if any neighbour (3x3) is solid
+    const out = new Uint8Array(w * h);
+    for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) {
+      if (!solid[j * w + i]) continue;
+      for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) {
+        const ii = i + di, jj = j + dj;
+        if (ii >= 0 && jj >= 0 && ii < w && jj < h) out[jj * w + ii] = 1;
+      }
+    }
+    wallGrid = { cs, i0: minX, j0: minZ, w, h, solid, free: null };
+  } catch (e) {
+    console.warn("wall build failed", e);
+    wallGrid = null;
+  }
+}
+function wallAt(x, z) {
+  const g = wallGrid;
+  if (!g) return false;
+  const i = Math.floor(x / g.cs) - g.i0, j = Math.floor(z / g.cs) - g.j0;
+  return i >= 0 && j >= 0 && i < g.w && j < g.h && g.solid[j * g.w + i] === 1 && !(g.free && g.free[j * g.w + i] === 1);
+}
+// keep the authored route walkable: doorways and halls along the tour path are never treated as walls
+function carveRoute() {
+  const g = wallGrid;
+  if (!g || !curve) return;
+  g.free = new Uint8Array(g.w * g.h);
+  const r = Math.ceil(WALLS.carve / g.cs), p = new THREE.Vector3();
+  for (let u = 0; u <= 1; u += 0.001) {
+    curve.getPointAt(u, p);
+    const ci = Math.floor(p.x / g.cs) - g.i0, cj = Math.floor(p.z / g.cs) - g.j0;
+    for (let dj = -r; dj <= r; dj++) for (let di = -r; di <= r; di++) {
+      if (di * di + dj * dj > r * r) continue;
+      const i = ci + di, j = cj + dj;
+      if (i >= 0 && j >= 0 && i < g.w && j < g.h) g.free[j * g.w + i] = 1;
+    }
+  }
+  for (const [ox, oz, or] of WALLS.openings) {
+    const rr = Math.ceil(or / g.cs), ci = Math.floor(ox / g.cs) - g.i0, cj = Math.floor(oz / g.cs) - g.j0;
+    for (let dj = -rr; dj <= rr; dj++) for (let di = -rr; di <= rr; di++) {
+      if (di * di + dj * dj > rr * rr) continue;
+      const i = ci + di, j = cj + dj;
+      if (i >= 0 && j >= 0 && i < g.w && j < g.h) g.free[j * g.w + i] = 1;
+    }
+  }
+  g.carvedFor = curve;
+}
+// is a person of radius r standing at (x, z) inside a wall?
+function segDist(px, pz, a, b) {
+  const dx = b[0] - a[0], dz = b[1] - a[1], l2 = dx * dx + dz * dz;
+  let t = l2 > 1e-9 ? ((px - a[0]) * dx + (pz - a[1]) * dz) / l2 : 0;
+  t = t < 0 ? 0 : t > 1 ? 1 : t;
+  return Math.hypot(px - (a[0] + dx * t), pz - (a[1] + dz * t));
+}
+function inPoly(px, pz, p) {
+  let c = false;
+  for (let i = 0, j = p.length - 1; i < p.length; j = i++) {
+    if (p[i][1] > pz !== p[j][1] > pz && px < ((p[j][0] - p[i][0]) * (pz - p[i][1])) / (p[j][1] - p[i][1]) + p[i][0]) c = !c;
+  }
+  return c;
+}
+// hand-drawn walls (author tool): open lines are thin barriers, closed shapes are solid surfaces
+function manualBlocked(x, z, r) {
+  const ws = pathData.collision && pathData.collision.walls;
+  if (!ws) return false;
+  const rr = r + 0.04;
+  for (const w of ws) {
+    const p = w.pts, n = p.length;
+    if (!n) continue;
+    if (n === 1) { if (Math.hypot(x - p[0][0], z - p[0][1]) < rr) return true; continue; }
+    const m = w.closed && n >= 3 ? n : n - 1;
+    for (let i = 0; i < m; i++) if (segDist(x, z, p[i], p[(i + 1) % n]) < rr) return true;
+    if (w.closed && n >= 3 && inPoly(x, z, p)) return true;
+  }
+  return false;
+}
+function blockedAt(x, z, r = WALLS.radius) {
+  if (manualBlocked(x, z, r)) return true;
+  if (!wallGrid || (pathData.collision && pathData.collision.auto === false)) return false;
+  if (wallAt(x, z)) return true;
+  for (let k = 0; k < 8; k++) {
+    const a = (k / 8) * Math.PI * 2;
+    if (wallAt(x + Math.cos(a) * r, z + Math.sin(a) * r)) return true;
+  }
+  return false;
+}
+// move from (x0, z0) toward (x1, z1); if that is blocked, slide along the wall (try each axis on its own); never starts a move from inside a wall
+function walkTo(p, x1, z1) {
+  if (!WALLS.on) { p.x = x1; p.z = z1; return; }
+  if (wallGrid && curve && wallGrid.carvedFor !== curve) carveRoute();
+  if (!blockedAt(x1, z1)) { p.x = x1; p.z = z1; return; }
+  if (blockedAt(p.x, p.z)) { p.x = x1; p.z = z1; return; } // already stuck inside something (a floater): let them move out
+  if (!blockedAt(x1, p.z)) p.x = x1;
+  else if (!blockedAt(p.x, z1)) p.z = z1;
+}
+
 function floorAt(x, z) {
   const g = floorGrid;
   if (!g) return -Infinity;
@@ -291,6 +462,8 @@ function floorAt(x, z) {
 }
 
 buildFloor();
+if (WALLS.on) buildWalls();
+if (AUTHOR) window.__wall = (x, z) => ({ solid: wallAt(x, z), blocked: blockedAt(x, z), cells: wallGrid && wallGrid.solid.reduce((a, b) => a + b, 0) });
 
 /* ------------------------------------------------------------------ *
  *  Camera state
@@ -387,7 +560,7 @@ function setEditing(on) {
   editing = !!on;
   const b = $("editBtn");
   if (b) {
-    b.textContent = editing ? "✓ Done editing" : "✎ Edit path";
+    b.textContent = editing ? "Done editing" : "Edit";
     b.classList.toggle("on", editing);
   }
   document.body.classList.toggle("editing", editing);
@@ -545,6 +718,109 @@ function setNow(idx) {
     c.mk.classList.toggle("now", k === idx);
   });
 }
+// Visitor playback bar: a hairline with a dot for each chapter. Chapters are moments, not ranges, so a chapter's name only
+// appears while you are near its dot (or when you hover it) and fades away in between.
+const vtl = { mk: [], playing: null, clock: "", fill: "", hover: false, timer: 0 };
+// The bar rests as a thin progress line. It opens when the pointer goes under it (or you tap there) and rests again shortly after you leave.
+function vtlWake(ms) {
+  const el = $("vtl");
+  el.classList.remove("min");
+  clearTimeout(vtl.timer);
+  if (!vtl.hover) vtl.timer = setTimeout(() => { if (!vtl.hover) el.classList.add("min"); }, ms); // rests after the delay whether playing or paused
+}
+let vtlSuppress = false; // a drag along the bar must not also count as a click
+const LBL_HOLD = 1.5, LBL_FADE = 0.8, LBL_LEAD = 0.5; // the caption shows from LBL_LEAD s before a chapter, holds LBL_HOLD s after it, then fades over LBL_FADE s // seconds a name stays fully visible around its dot, then the time it takes to fade out
+function buildVtl() {
+  const box = $("vMarks"), dur = pathData.duration, n = chapterEls.length;
+  box.innerHTML = "";
+  vtl.mk = [];
+  vtl.playing = null;
+  vtl.clock = "";
+  vtl.fill = "";
+  vtl.cap = -1;
+  vtl.capO = -1;
+  vtlWake(3000); // open for a moment when the tour starts so people see the controls
+  chapterEls.forEach((c, k) => {
+    const el = document.createElement("button");
+    el.className = "vmk" + (k === 0 ? " first" : "") + (k === n - 1 ? " last" : "");
+    el.style.left = (c.u * 100).toFixed(3) + "%";
+    el.setAttribute("aria-label", c.name + ", " + fmtT(c.u * dur));
+    el.innerHTML = '<i></i><span class="lbl"><b></b><em></em></span>';
+    el.querySelector("b").textContent = c.name;
+    el.querySelector("em").textContent = fmtT(c.u * dur);
+    el.addEventListener("click", () => { if (!vtlSuppress) c.go(); });
+    box.appendChild(el);
+    vtl.mk.push({ el, o: -1, done: null, on: null });
+  });
+  const head = document.createElement("div");
+  head.id = "vHead";
+  box.appendChild(head);
+  vtl.head = head;
+}
+// Previous / next chapter (phone pager). Previous restarts the current chapter if you are more than 3 s into it, otherwise goes back one.
+function vtlStep(dir) {
+  if (mode !== "tour" || !chapterEls.length) return;
+  const dur = pathData.duration;
+  let a = -1;
+  chapterEls.forEach((c, k) => { if (c.u <= tourU + 0.002) a = k; });
+  const k = dir < 0 ? (a < 0 || (tourU - chapterEls[a].u) * dur > 3 ? Math.max(a, 0) : Math.max(a - 1, 0)) : Math.min(a + 1, chapterEls.length - 1);
+  chapterEls[k].go();
+}
+// Time (0..1) under a screen x on the bar.
+function vtlU(x) {
+  const r = $("vLine").getBoundingClientRect();
+  return Math.min(1, Math.max(0, (x - r.left - 7) / Math.max(1, r.width - 14)));
+}
+// Jump the tour to a time and keep playing if it was playing; dip to black for a big jump so it does not fly through the house.
+function seekTo(u) {
+  if (mode !== "tour") return;
+  clearTimeout(seekTo.t);
+  const veil = $("veil");
+  if (Math.abs(u - tourU) < 0.03 || !veil || matchMedia("(prefers-reduced-motion: reduce)").matches) return snapTour(u);
+  veil.style.transitionDuration = "0.22s";
+  veil.style.opacity = "1";
+  seekTo.t = setTimeout(() => {
+    snapTour(u);
+    veil.style.transitionDuration = "0.45s";
+    veil.style.opacity = "0";
+  }, 240);
+}
+function updateVtl(u) {
+  if (!vtl.mk.length) return;
+  const dur = pathData.duration;
+  const fill = "calc(7px + (100% - 14px) * " + u.toFixed(4) + ")";
+  if (fill !== vtl.fill) { vtl.fill = fill; $("vFill").style.width = fill; vtl.head.style.left = (u * 100).toFixed(3) + "%"; }
+  let near = -1, nd = Infinity;
+  chapterEls.forEach((c, k) => { const d = Math.abs(u - c.u) * dur; if (d < nd) { nd = d; near = k; } });
+  vtl.mk.forEach((m, k) => {
+    const o = k === near ? (nd <= LBL_HOLD ? 1 : nd >= LBL_HOLD + LBL_FADE ? 0 : 1 - (nd - LBL_HOLD) / LBL_FADE) : 0;
+    const q = Math.round(o * 20) / 20;
+    const on = q >= 0.5, done = chapterEls[k].u <= u + 0.002;
+    if (on !== m.on) { m.on = on; m.el.classList.toggle("on", on); }
+    if (done !== m.done) { m.done = done; m.el.classList.toggle("done", done); }
+  });
+  // big chapter caption above the bar: shows while you are at a chapter, then fades
+  const sd = near < 0 ? 0 : (u - chapterEls[near].u) * dur; // seconds since the nearest chapter (negative = still approaching)
+  const hq = near < 0 ? 0 : sd < 0 ? (sd >= -LBL_LEAD ? 1 : 0) : sd <= LBL_HOLD ? 1 : sd >= LBL_HOLD + LBL_FADE ? 0 : 1 - (sd - LBL_HOLD) / LBL_FADE;
+  if (near >= 0 && hq > 0 && near !== vtl.cap) {
+    vtl.cap = near;
+    $("vCapNum").textContent = "CHAPTER " + (near + 1) + " OF " + chapterEls.length;
+    $("vCapName").textContent = chapterEls[near].name;
+  }
+  const hr = Math.round(hq * 20) / 20;
+  if (hr !== vtl.capO) { vtl.capO = hr; $("vCap").style.opacity = hr; }
+  const t0 = fmtT(u * dur);
+  if (t0 !== vtl.t0) { vtl.t0 = t0; $("vT0").textContent = t0; }
+  if (vtl.t1 == null) { vtl.t1 = 1; $("vT1").textContent = fmtT(dur); }
+  const clock = fmtT(u * dur) + " / " + fmtT(dur);
+  if (clock !== vtl.clock) { vtl.clock = clock; $("vClock").textContent = clock; }
+  if (playing !== vtl.playing) {
+    vtlWake(vtl.playing === null ? 3000 : playing ? 1500 : 4000); // pausing opens the full bar for 4s, then it rests; playing again lets it rest after 1.5s
+    vtl.playing = playing;
+    $("vtl").classList.toggle("playing", playing);
+    $("vPlay").setAttribute("aria-label", playing ? "Pause" : "Play");
+  }
+}
 // Visitor view: only the points you gave a name become chapters, on the timeline and in a small menu.
 function renderChapters() {
   const wps = pathData.waypoints, dur = pathData.duration;
@@ -552,6 +828,8 @@ function renderChapters() {
   const btn = $("ptsBtn"), list = $("pts"), marks = $("marks");
   marks.innerHTML = "";
   list.innerHTML = "";
+  $("vMarks").innerHTML = "";
+  vtl.mk = [];
   chapterEls = [];
   nowIdx = -2;
   document.body.classList.toggle("chapters", named.length > 0);
@@ -613,8 +891,9 @@ function renderChapters() {
     row.querySelector(".nm").textContent = w.name;
     row.addEventListener("click", go);
     list.appendChild(row);
-    chapterEls.push({ u, row, mk, p: w.p });
+    chapterEls.push({ u, row, mk, p: w.p, go, name: w.name });
   });
+  buildVtl();
 }
 
 function renderTimeline() {
@@ -694,7 +973,7 @@ function renderTimeline() {
     row.className = "pt" + cls;
     const dflt = i === 0 ? "Start" : i === n - 1 ? "End" : "Point";
     const nm = wps[i].name;
-    row.innerHTML = "<b>" + (i + 1) + "</b><span class=\"nm" + (nm ? "" : " dflt") + "\"></span><em>" + (curve ? fmtT(u * dur) : "–") + "</em><button class=\"ren\" title=\"Rename\">✎</button>";
+    row.innerHTML = "<b>" + (i + 1) + "</b><span class=\"nm" + (nm ? "" : " dflt") + "\"></span><em>" + (curve ? fmtT(u * dur) : "–") + "</em><button class=\"ren\" title=\"Rename\">Rename</button>";
     row.querySelector(".nm").textContent = nm || dflt;
     const startRename = () => {
       const span = row.querySelector(".nm");
@@ -876,7 +1155,7 @@ function rebuildPath() {
       const radial = 6;
       const g = new THREE.TubeGeometry(curve, segs, diag * 0.0016, radial, false);
       const cols = new Float32Array(g.attributes.position.count * 3);
-      const c0 = new THREE.Color(0x6ee7a8), c1 = new THREE.Color(0xffb454), c2 = new THREE.Color(0xff5c8a);
+      const c0 = new THREE.Color(0x6ee7a8), c1 = new THREE.Color(0xffb454), c2 = new THREE.Color(0xff4a4a);
       const tmp = new THREE.Color();
       for (let i = 0; i < g.attributes.position.count; i++) {
         const t = Math.floor(i / (radial + 1)) / segs;
@@ -908,7 +1187,7 @@ function rebuildPath() {
     }
     wps.forEach((w, i) => {
       const sel = i === selected;
-      const color = sel ? 0x5cc8ff : i === 0 ? 0x6ee7a8 : i === wps.length - 1 ? 0xff5c8a : 0xffb454;
+      const color = sel ? 0x5cc8ff : i === 0 ? 0x6ee7a8 : i === wps.length - 1 ? 0xff4a4a : 0xffb454;
       // the point itself: a numbered ball (one sprite, so the number can never drift off the ball)
       const m = makeBall(i + 1, color, sel);
       m.position.set(...w.p);
@@ -1192,7 +1471,7 @@ function selectPoint(i, msg) {
 canvas.addEventListener("pointerdown", (e) => {
   drag = { type: e.pointerType, x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY, moved: false, point: -1, look: -1, tan: null };
   if (AUTHOR && !preview && !editing && mode === "free" && e.button === 0 && pickWaypoint(e) >= 0) {
-    hudFlash("Turn on ✎ Edit path (top right, or press M) to move points");
+    hudFlash("Turn on Edit (top right, or press M) to move points");
   }
   if (AUTHOR && !preview && editing && mode === "free" && e.button === 0) {
     const th = pickTangent(e);
@@ -1388,6 +1667,310 @@ canvas.addEventListener(
   { passive: false }
 );
 
+
+/* ------------------------------------------------------------------ *
+ *  Collision walls (author): a pen tool. Click the floor to drop points along the base of a wall; click the first point to close
+ *  a shape (solid surface). Saved in path.json as  collision: { auto, walls: [{ pts: [[x, z], ...], closed }] }.
+ * ------------------------------------------------------------------ */
+const COL = { on: false, drawing: -1, sel: { w: -1, i: -1 }, hist: [], drag: null, down: null, grp: new THREE.Group() };
+overlay.add(COL.grp);
+function colData() {
+  pathData.collision ??= { auto: true, walls: [] };
+  pathData.collision.walls ??= [];
+  return pathData.collision;
+}
+function colSnap() { COL.hist.push(JSON.stringify(colData())); if (COL.hist.length > 100) COL.hist.shift(); }
+function colSave() { save(); colRebuild(); colPanelSync(); }
+function colUndo() {
+  if (!COL.hist.length) return hudFlash("Nothing to undo");
+  pathData.collision = JSON.parse(COL.hist.pop());
+  COL.drawing = -1; COL.sel = { w: -1, i: -1 };
+  colSave();
+  hudFlash("Undo");
+}
+const r2 = (v) => +v.toFixed(3);
+function floorHit(e) {
+  setRay(e);
+  const o = raycaster.ray.origin, d = raycaster.ray.direction;
+  if (floorGrid) {
+    let pt = 0;
+    for (let t = 0.15; t < 60; t += 0.04) {
+      const x = o.x + d.x * t, y = o.y + d.y * t, z = o.z + d.z * t, f = floorAt(x, z);
+      if (y < f) {
+        // refine between the last step and this one
+        let lo = pt, hi = t;
+        for (let k = 0; k < 8; k++) {
+          const m = (lo + hi) / 2;
+          if (o.y + d.y * m < floorAt(o.x + d.x * m, o.z + d.z * m)) hi = m; else lo = m;
+        }
+        return [o.x + d.x * hi, o.z + d.z * hi];
+      }
+      pt = t;
+    }
+  }
+  const fy = floorGrid ? floorAt(camera.position.x, camera.position.z) : 0;
+  const t = d.y < -1e-4 ? (fy - o.y) / d.y : -1;
+  return t > 0 ? [o.x + d.x * t, o.z + d.z * t] : null;
+}
+const _cp = new THREE.Vector3();
+function colScreen(pt) {
+  const y = floorAt(pt[0], pt[1]);
+  return toScreen(_cp.set(pt[0], isFinite(y) ? y + 0.03 : 0, pt[1]));
+}
+function colPickPoint(e, within = 13) {
+  let best = null, bd = within;
+  colData().walls.forEach((w, wi) => w.pts.forEach((p, i) => {
+    const s = colScreen(p);
+    if (!s) return;
+    const d = Math.hypot(s[0] - e.clientX, s[1] - e.clientY);
+    if (d < bd) { bd = d; best = { w: wi, i }; }
+  }));
+  return best;
+}
+function colPickSegment(e, within = 10) {
+  let best = null, bd = within;
+  colData().walls.forEach((w, wi) => {
+    const n = w.pts.length, m = w.closed && n >= 3 ? n : n - 1;
+    for (let i = 0; i < m; i++) {
+      const a = colScreen(w.pts[i]), b = colScreen(w.pts[(i + 1) % n]);
+      if (!a || !b) continue;
+      const dx = b[0] - a[0], dy = b[1] - a[1], l2 = dx * dx + dy * dy || 1;
+      const t = clamp(((e.clientX - a[0]) * dx + (e.clientY - a[1]) * dy) / l2, 0, 1);
+      const d = Math.hypot(e.clientX - (a[0] + dx * t), e.clientY - (a[1] + dy * t));
+      if (d < bd) { bd = d; best = { w: wi, i, t }; }
+    }
+  });
+  return best;
+}
+function colRebuild() {
+  disposeGroup(COL.grp);
+  const walls = colData().walls;
+  const H = 1.8;
+  walls.forEach((w, wi) => {
+    const n = w.pts.length;
+    if (!n) return;
+    const ys = w.pts.map((p) => { const y = floorAt(p[0], p[1]); return isFinite(y) ? y : 0; });
+    const active = COL.on && (COL.sel.w === wi || COL.drawing === wi);
+    const col = active ? 0xffb454 : 0xff6b4a;
+    const m = w.closed && n >= 3 ? n : n - 1;
+    if (m > 0) {
+      const pos = [], idx = [];
+      for (let i = 0; i < m; i++) {
+        const a = w.pts[i], b = w.pts[(i + 1) % n], ya = ys[i], yb = ys[(i + 1) % n];
+        const k = pos.length / 3;
+        pos.push(a[0], ya, a[1], b[0], yb, b[1], b[0], yb + H, b[1], a[0], ya + H, a[1]);
+        idx.push(k, k + 1, k + 2, k, k + 2, k + 3);
+      }
+      const g = new THREE.BufferGeometry();
+      g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+      g.setIndex(idx);
+      COL.grp.add(new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: COL.on ? 0.2 : 0.1, side: THREE.DoubleSide, depthTest: false, depthWrite: false })));
+      const lp = [];
+      for (let i = 0; i <= m; i++) { const q = w.pts[i % n]; lp.push(q[0], ys[i % n] + 0.03, q[1]); }
+      const lg = new THREE.BufferGeometry();
+      lg.setAttribute("position", new THREE.Float32BufferAttribute(lp, 3));
+      COL.grp.add(new THREE.Line(lg, new THREE.LineBasicMaterial({ color: col, depthTest: false, transparent: true, opacity: COL.on ? 1 : 0.6 })));
+    }
+    if (COL.on) {
+      const pp = [];
+      w.pts.forEach((q, i) => pp.push(q[0], ys[i] + 0.03, q[1]));
+      const pg = new THREE.BufferGeometry();
+      pg.setAttribute("position", new THREE.Float32BufferAttribute(pp, 3));
+      COL.grp.add(new THREE.Points(pg, new THREE.PointsMaterial({ color: col, size: 9, sizeAttenuation: false, depthTest: false })));
+      if (COL.sel.w === wi && COL.sel.i >= 0 && w.pts[COL.sel.i]) {
+        const q = w.pts[COL.sel.i], sg = new THREE.BufferGeometry();
+        sg.setAttribute("position", new THREE.Float32BufferAttribute([q[0], ys[COL.sel.i] + 0.03, q[1]], 3));
+        COL.grp.add(new THREE.Points(sg, new THREE.PointsMaterial({ color: 0xffffff, size: 13, sizeAttenuation: false, depthTest: false })));
+      }
+      // first point of the wall being drawn: a ring so you can see where to click to close it
+      if (COL.drawing === wi && n >= 3 && !w.closed) {
+        const fg = new THREE.BufferGeometry();
+        fg.setAttribute("position", new THREE.Float32BufferAttribute([w.pts[0][0], ys[0] + 0.03, w.pts[0][1]], 3));
+        COL.grp.add(new THREE.Points(fg, new THREE.PointsMaterial({ color: 0x6ee7a8, size: 15, sizeAttenuation: false, depthTest: false })));
+      }
+    }
+  });
+}
+function colPanelSync() {
+  const c = colData();
+  const n = c.walls.length, pts = c.walls.reduce((a, w) => a + w.pts.length, 0);
+  $("colCount").textContent = n + (n === 1 ? " wall" : " walls") + ", " + pts + " pts";
+  $("colAuto").checked = c.auto !== false;
+}
+function setColMode(on) {
+  if (!AUTHOR || preview === true) return;
+  COL.on = !!on;
+  COL.drawing = -1; COL.sel = { w: -1, i: -1 };
+  document.body.classList.toggle("coling", COL.on);
+  $("colBtn").classList.toggle("on", COL.on);
+  $("colPanel").hidden = !COL.on;
+  if (COL.on) {
+    if (editing) setEditing(false);
+    if (mode === "tour") setMode("free", false, true);
+    colPanelSync();
+    hudFlash("Walls · click the floor along the base of a wall to drop points");
+  } else hudFlash("Walls tool off");
+  colRebuild();
+}
+function colFinish() {
+  if (COL.drawing >= 0) {
+    const w = colData().walls[COL.drawing];
+    if (w && w.pts.length < 2) colData().walls.splice(COL.drawing, 1);
+  }
+  COL.drawing = -1;
+  COL.sel = { w: -1, i: -1 };
+  colSave();
+}
+function colDeletePoint(wi, i) {
+  const c = colData(), w = c.walls[wi];
+  if (!w) return;
+  colSnap();
+  w.pts.splice(i, 1);
+  if (w.pts.length < 3) w.closed = false;
+  if (!w.pts.length) { c.walls.splice(wi, 1); if (COL.drawing === wi) COL.drawing = -1; else if (COL.drawing > wi) COL.drawing--; }
+  COL.sel = { w: -1, i: -1 };
+  colSave();
+}
+function colDeleteWall(wi) {
+  const c = colData();
+  if (!c.walls[wi]) return;
+  colSnap();
+  c.walls.splice(wi, 1);
+  if (COL.drawing === wi) COL.drawing = -1; else if (COL.drawing > wi) COL.drawing--;
+  COL.sel = { w: -1, i: -1 };
+  colSave();
+}
+if (AUTHOR) {
+  const cb = $("colBtn");
+  cb.hidden = true; // wall tool hidden for now
+  cb.addEventListener("click", () => setColMode(!COL.on));
+  $("colUndo").addEventListener("click", colUndo);
+  $("colDelWall").addEventListener("click", () => (COL.sel.w >= 0 ? colDeleteWall(COL.sel.w) : hudFlash("Click a wall first")));
+  $("colClose").addEventListener("click", () => {
+    const w = colData().walls[COL.sel.w];
+    if (!w) return hudFlash("Click a wall first");
+    if (w.pts.length < 3) return hudFlash("A closed shape needs 3 or more points");
+    colSnap(); w.closed = !w.closed; COL.drawing = -1; colSave();
+  });
+  $("colClear").addEventListener("click", () => {
+    if (!colData().walls.length) return;
+    if (!confirm("Remove every collision wall?")) return;
+    colSnap(); colData().walls = []; COL.drawing = -1; COL.sel = { w: -1, i: -1 }; colSave();
+  });
+  $("colAuto").addEventListener("change", (e) => { colSnap(); colData().auto = e.target.checked; colSave(); hudFlash(e.target.checked ? "Auto-detect on" : "Auto-detect off · only your drawn walls block"); });
+  colRebuild();
+
+  canvas.addEventListener("pointerdown", (e) => {
+    if (!COL.on || preview || e.button !== 0) return;
+    COL.down = { x: e.clientX, y: e.clientY, moved: false, pt: colPickPoint(e) };
+    if (COL.down.pt) {
+      e.stopImmediatePropagation();
+      const { w, i } = COL.down.pt;
+      if (e.altKey) { COL.down = null; return colDeletePoint(w, i); }
+      COL.drag = { w, i, snap: false };
+      try { canvas.setPointerCapture(e.pointerId); } catch {}
+    }
+  }, true);
+  canvas.addEventListener("pointermove", (e) => {
+    if (!COL.on || preview) return;
+    if (COL.down && Math.hypot(e.clientX - COL.down.x, e.clientY - COL.down.y) > 4) COL.down.moved = true;
+    if (COL.drag) {
+      e.stopImmediatePropagation();
+      if (!COL.down.moved) return;
+      const h = floorHit(e);
+      if (!h) return;
+      if (!COL.drag.snap) { colSnap(); COL.drag.snap = true; }
+      const w = colData().walls[COL.drag.w];
+      if (w) w.pts[COL.drag.i] = [r2(h[0]), r2(h[1])];
+      colRebuild();
+      return;
+    }
+    if (!COL.down) canvas.style.cursor = colPickPoint(e) ? "grab" : "crosshair";
+  }, true);
+  canvas.addEventListener("pointerup", (e) => {
+    if (!COL.on || preview) return;
+    const dn = COL.down; COL.down = null;
+    if (COL.drag) {
+      const d = COL.drag; COL.drag = null;
+      e.stopImmediatePropagation();
+      if (dn && !dn.moved) {
+        // plain click on a point: close the shape (first point of the wall being drawn), keep drawing (end point), or just select it
+        const c = colData(), w = c.walls[d.w];
+        if (COL.drawing === d.w && d.i === 0 && w.pts.length >= 3) { colSnap(); w.closed = true; COL.drawing = -1; COL.sel = { w: d.w, i: -1 }; colSave(); return hudFlash("Shape closed"); }
+        COL.sel = { w: d.w, i: d.i };
+        if (!w.closed && (d.i === w.pts.length - 1 || d.i === 0) && COL.drawing !== d.w) {
+          if (d.i === 0 && w.pts.length > 1) w.pts.reverse();
+          COL.drawing = d.w; COL.sel = { w: d.w, i: w.pts.length - 1 };
+          hudFlash("Keep drawing · Enter to finish");
+        }
+        colRebuild(); colPanelSync();
+      } else colSave();
+      return;
+    }
+    if (!dn || dn.moved || (e.target !== canvas)) return;
+    const c = colData();
+    if (COL.drawing < 0) {
+      const sg = colPickSegment(e);
+      if (sg) { COL.sel = { w: sg.w, i: -1 }; colRebuild(); return; }
+    }
+    const h = floorHit(e);
+    if (!h) return hudFlash("Aim at the floor");
+    colSnap();
+    const pt = [r2(h[0]), r2(h[1])];
+    if (COL.drawing < 0 || !c.walls[COL.drawing]) {
+      c.walls.push({ pts: [pt], closed: false });
+      COL.drawing = c.walls.length - 1;
+    } else c.walls[COL.drawing].pts.push(pt);
+    COL.sel = { w: COL.drawing, i: c.walls[COL.drawing].pts.length - 1 };
+    colSave();
+  }, true);
+  canvas.addEventListener("pointercancel", () => { COL.down = null; COL.drag = null; }, true);
+  canvas.addEventListener("contextmenu", (e) => {
+    if (!COL.on) return;
+    const p = colPickPoint(e);
+    if (p) { e.preventDefault(); colDeletePoint(p.w, p.i); }
+  });
+  canvas.addEventListener("dblclick", (e) => {
+    if (!COL.on || preview) return;
+    e.stopImmediatePropagation();
+    const c = colData();
+    if (COL.drawing >= 0) {
+      // the two clicks of the double-click each dropped a point on the same spot; keep one and finish
+      const w = c.walls[COL.drawing];
+      if (w && w.pts.length > 1) {
+        const a = w.pts[w.pts.length - 1], b = w.pts[w.pts.length - 2];
+        if (Math.hypot(a[0] - b[0], a[1] - b[1]) < 0.3) w.pts.pop();
+      }
+      return colFinish();
+    }
+    const sg = colPickSegment(e);
+    if (!sg) return;
+    const w = c.walls[sg.w], a = w.pts[sg.i], b = w.pts[(sg.i + 1) % w.pts.length];
+    colSnap();
+    w.pts.splice(sg.i + 1, 0, [r2(a[0] + (b[0] - a[0]) * sg.t), r2(a[1] + (b[1] - a[1]) * sg.t)]);
+    COL.sel = { w: sg.w, i: sg.i + 1 };
+    colSave();
+  }, true);
+  window.addEventListener("keydown", (e) => {
+    if (e.target instanceof HTMLInputElement) return;
+    const k = e.key.toLowerCase();
+    if (!preview && !e.ctrlKey && !e.metaKey && !e.altKey && k === "b" && false) { e.stopImmediatePropagation(); return setColMode(!COL.on); }
+    if (!COL.on) return;
+    if ((e.ctrlKey || e.metaKey) && k === "z") { e.stopImmediatePropagation(); e.preventDefault(); return colUndo(); }
+    if (k === "enter" || k === "escape") {
+      e.stopImmediatePropagation();
+      if (COL.drawing >= 0 || COL.sel.w >= 0) return colFinish();
+      return setColMode(false);
+    }
+    if (k === "backspace" || k === "delete") {
+      e.stopImmediatePropagation(); e.preventDefault();
+      if (COL.sel.w >= 0 && COL.sel.i >= 0) return colDeletePoint(COL.sel.w, COL.sel.i);
+      if (COL.sel.w >= 0) return colDeleteWall(COL.sel.w);
+      return hudFlash("Click a point or wall first");
+    }
+  }, true);
+}
+
 window.addEventListener("keydown", (e) => {
   if (e.target instanceof HTMLInputElement) return;
   const k = e.key.toLowerCase();
@@ -1565,11 +2148,9 @@ if (padEl) {
   new MutationObserver(resetStick).observe(document.body, { attributes: true, attributeFilter: ["data-mode"] });
 }
 
-window.addEventListener("resize", () => {
-  camera.aspect = window.innerWidth / window.innerHeight;
-  camera.updateProjectionMatrix();
-  renderer.setSize(window.innerWidth, window.innerHeight);
-});
+window.addEventListener("resize", fitCanvas);
+if (window.ResizeObserver) new ResizeObserver(fitCanvas).observe(canvas);
+fitCanvas();
 
 /* ------------------------------------------------------------------ *
  *  UI
@@ -1596,6 +2177,77 @@ $("modeBtn").addEventListener("click", () => {
     if (curve) setMode("tour");
   }
 });
+$("vPlay").addEventListener("click", () => $("playBtn").click());
+$("vReset").addEventListener("click", () => $("resetBtn").click());
+$("vPrev").addEventListener("click", () => vtlStep(-1));
+$("vNext").addEventListener("click", () => vtlStep(1));
+$("vtl").querySelector(".vin").addEventListener("pointerenter", () => (overBar = true));
+$("vtl").querySelector(".vin").addEventListener("pointerleave", () => (overBar = false));
+{
+  const vin = $("vtl").querySelector(".vin"), hot = $("vHot");
+  const enter = (e) => { if (e.pointerType === "mouse") { vtl.hover = true; vtlWake(); } };
+  const leave = (e) => { if (e.pointerType === "mouse") { vtl.hover = false; vtlWake(700); } };
+  hot.addEventListener("pointerenter", enter);
+  vin.addEventListener("pointerenter", enter);
+  vin.addEventListener("pointerleave", leave);
+  const touch = (e) => { if (e.pointerType !== "mouse") vtlWake(4000); };
+  hot.addEventListener("pointerdown", touch);
+  vin.addEventListener("pointerdown", touch);
+  vin.addEventListener("pointerup", touch);
+  $("vtl").addEventListener("focusin", () => vtlWake(4000));
+}
+{
+  // press and drag along the line to scrub; a plain click on the line jumps there; a click on a dot jumps to that chapter
+  let drag = null;
+  const scrub = (x) => {
+    if (mode !== "tour" || !vtl.mk.length) return;
+    tourTarget = vtlU(x);
+    playing = false;
+    $("playBtn").textContent = "\u25B6";
+  };
+  $("vTrack").addEventListener("pointerdown", (e) => { if (e.button === 0) drag = { sx: e.clientX, moved: false }; });
+  window.addEventListener("pointermove", (e) => {
+    if (!drag || (!drag.moved && Math.abs(e.clientX - drag.sx) < 6)) return;
+    drag.moved = true;
+    scrub(e.clientX);
+  });
+  const endDrag = () => {
+    if (drag && drag.moved) { vtlSuppress = true; setTimeout(() => (vtlSuppress = false), 0); vtlWake(4000); }
+    drag = null;
+  };
+  window.addEventListener("pointerup", endDrag);
+  window.addEventListener("pointercancel", endDrag);
+  $("vTrack").addEventListener("click", (e) => { if (vtlSuppress || e.target.closest(".vmk")) return; seekTo(vtlU(e.clientX)); });
+}
+{
+  // first movement in a mode folds the control hint into the "?" button
+  const hintOn = () => !AUTHOR || preview;
+  document.body.classList.add("moved-tour"); // tour mode starts with just the "?"; the hint text stays tucked behind it
+  const moved = () => { if (hintOn()) document.body.classList.add("moved-" + mode); };
+  const inUi = (t) => t && t.closest && t.closest("#vtl, #ui, #hint, #hintQ, #author, #colPanel, #pad, #vert");
+  window.addEventListener("wheel", (e) => { if (!inUi(e.target)) moved(); }, { passive: true });
+  window.addEventListener("keydown", (e) => { if (["w", "a", "s", "d", "q", "e", "arrowup", "arrowdown", "arrowleft", "arrowright"].includes(e.key.toLowerCase()) && !e.ctrlKey && !e.metaKey && !e.altKey) moved(); });
+  let dragFrom = null;
+  const q = $("hintQ"), body = document.body;
+  let pinned = false;
+  const open = (on) => { body.classList.toggle("hint-open", on); q.setAttribute("aria-expanded", on ? "true" : "false"); };
+  const phone = matchMedia("(max-width:640px), (pointer:coarse)"); // phones have no hover: the "?" is a plain toggle there
+  // on phones, moving (left stick, Up / Down, or a drag to look) sends an open hint back to the plain "?"
+  const tuck = () => { if (phone.matches && hintOn() && pinned) { pinned = false; body.classList.remove("hint-pinned"); q.setAttribute("aria-label", "Show controls"); open(false); } };
+  window.addEventListener("pointerdown", (e) => { dragFrom = inUi(e.target) && !e.target.closest("#pad, #vert") ? null : { x: e.clientX, y: e.clientY }; if (e.target.closest && e.target.closest("#pad, #vert")) tuck(); });
+  window.addEventListener("pointermove", (e) => { if (dragFrom && e.buttons && Math.hypot(e.clientX - dragFrom.x, e.clientY - dragFrom.y) > 5) { moved(); tuck(); dragFrom = null; } });
+  window.addEventListener("pointerup", () => (dragFrom = null));
+  // hover shows the hint until the pointer leaves; a click or tap pins it open until the "?" is clicked or tapped again
+  q.addEventListener("pointerenter", (e) => { if (e.pointerType === "mouse" && !phone.matches) open(true); });
+  q.addEventListener("pointerleave", (e) => { if (e.pointerType === "mouse" && !phone.matches && !pinned) open(false); });
+  q.addEventListener("click", () => {
+    pinned = !pinned;
+    body.classList.toggle("hint-pinned", pinned); // pinned open: the "?" turns into an X that closes it
+    q.setAttribute("aria-label", pinned ? "Hide controls" : "Show controls");
+    open(pinned || (!phone.matches && q.matches(":hover")));
+  });
+  q.addEventListener("blur", () => { if (!pinned) open(false); });
+}
 $("slider").addEventListener("input", (e) => {
   tourTarget = Number(e.target.value) / 1000;
   playing = false;
@@ -1786,7 +2438,11 @@ function frame(now) {
       wish.copy(jv);
     }
     vel.lerp(wish, 1 - Math.exp(-dt * 10));
-    camera.position.addScaledVector(vel, dt);
+    {
+      const nx = camera.position.x + vel.x * dt, nz = camera.position.z + vel.z * dt;
+      walkTo(camera.position, nx, nz);
+      camera.position.y += vel.y * dt;
+    }
     if (GROUND.on && floorGrid) {
       const minY = floorAt(camera.position.x, camera.position.z) + clearance;
       if (camera.position.y < minY) {
@@ -1825,10 +2481,11 @@ function frame(now) {
     _off.setFromEuler(euler.set(lookPitch, lookYaw, 0, "YXZ"));
     _tq.copy(_pq).multiply(_off);
     camera.quaternion.slerp(_tq, 1 - Math.exp(-dt * (playing && !glide ? 40 : 6)));
-    if (chapterEls.length) updateNow(tourU);
+    if (chapterEls.length) { updateNow(tourU); updateVtl(tourU); }
     const over = tourTarget >= 0.999 && tourU >= 0.99;
     if (over !== tourOver) { tourOver = over; document.body.classList.toggle("ended", over); } // phones show Restart only once the tour is over
     if (document.activeElement !== $("slider")) $("slider").value = Math.round(tourTarget * 1000);
+    $("slider").style.setProperty("--p", $("slider").value / 10 + "%");
     if (AUTHOR) $("clock").textContent = fmtT(tourU * pathData.duration) + " / " + fmtT(pathData.duration);
   }
 
@@ -1865,11 +2522,16 @@ function frame(now) {
 const pipCam = new THREE.PerspectiveCamera(camera.fov, 16 / 9, 0.01, 1000);
 const _pipP = new THREE.Vector3(), _pipQ = new THREE.Quaternion(), _pipE = new THREE.Euler(0, 0, 0, "YXZ");
 /* ---- Erase tool: click a stray splat, mark a ball around it, saved to erase.json for cleanup ---- */
+// Every mark is saved to erase.json automatically, and serve.mjs removes those splats from the splat file in your folder (the original is kept as <name>.original.spz).
 const eraseList = []; // { p:[x,y,z] (world), r }
+if (AUTHOR) {
+  const ej = await fetchJSON("./erase.json", null);
+  if (ej && Array.isArray(ej.spheres)) for (const e of ej.spheres) eraseList.push({ p: e.p.slice(), r: e.r });
+}
 let eraseOn = false;
 let eraseDirty = false;
 let eraseEdit = null; // one SplatEdit on the splat mesh; each mark is a transparent ball inside it (live preview of the removal)
-function drawErase() {
+function drawErase(initial = false) {
   if (!eraseEdit) {
     eraseEdit = new SplatEdit({ rgbaBlendMode: SplatEditRgbaBlendMode.MULTIPLY, softEdge: 0, sdfSmooth: 0 });
     mesh.add(eraseEdit);
@@ -1880,9 +2542,14 @@ function drawErase() {
     sdf.position.copy(mesh.worldToLocal(new THREE.Vector3().fromArray(e.p)));
     eraseEdit.add(sdf);
   }
-  eraseDirty = true;
   $("eraseCount").textContent = eraseList.length + " erased";
-  $("eraseMsg").textContent = eraseList.length ? "Not saved yet. Press Save & done when you are finished." : "";
+  if (AUTHOR && !initial) scheduleEraseSave();
+}
+let eraseTimer = 0;
+function scheduleEraseSave() {
+  $("eraseMsg").textContent = "Saving...";
+  clearTimeout(eraseTimer);
+  eraseTimer = setTimeout(saveErase, 900);
 }
 const eraseRay = new THREE.Raycaster();
 // undo / redo for the eraser: snapshots of the list (while erase mode is on, Ctrl+Z / Ctrl+Y / Backspace act here, not on the path)
@@ -1902,25 +2569,30 @@ function eraseStep(dir) {
   drawErase();
 }
 async function saveErase() {
-  const body = JSON.stringify({ note: "world coordinates; splat file x,y,z = world x,-z,y", spheres: eraseList });
+  const body = JSON.stringify({ note: "world coordinates; splat file x,y,z = world x,-z,y (for orientation 3)", orientation: pathData.orientation, spheres: eraseList });
   try {
     const r = await fetch("/__erase", { method: "POST", headers: { "Content-Type": "application/json" }, body });
     if (!r.ok) throw new Error(r.status);
-    eraseDirty = false;
-    $("eraseMsg").textContent = "Saved to erase.json (" + eraseList.length + " marks). Tell Claude: apply the erase list.";
+    $("eraseMsg").textContent = "Saved. Updating the splat file...";
+    for (let i = 0; i < 120; i++) {
+      await new Promise((ok) => setTimeout(ok, 1500));
+      const st = await fetch("/__bake-status", { cache: "no-store" }).then((x) => x.json());
+      if (st.state === "done") return ($("eraseMsg").textContent = "Splat file updated (" + st.removed.toLocaleString() + " splats removed). Reload to see it.");
+      if (st.state === "error") return ($("eraseMsg").textContent = "Saved to erase.json, but updating the splat failed: " + st.error);
+    }
   } catch {
     const a = document.createElement("a");
     a.href = URL.createObjectURL(new Blob([body], { type: "application/json" }));
     a.download = "erase.json";
     a.click();
-    $("eraseMsg").textContent = "Server can't save: downloaded erase.json instead. Restart start-author.bat to enable auto-save.";
+    $("eraseMsg").textContent = "Server can't save: downloaded erase.json instead. Close and re-run start-author.bat.";
   }
 }
+if (eraseList.length) drawErase(true);
 let editBeforeErase = false;
 function setErase(on) {
   const wasOn = eraseOn;
   eraseOn = on;
-  if (wasOn && !on && eraseDirty && eraseList.length) saveErase(); // one save, when you finish
   document.body.classList.toggle("erasing", on);
   $("eraseBtn").classList.toggle("on", on);
   $("erasePanel").hidden = !on;
@@ -2086,7 +2758,7 @@ if (AUTHOR) {
 }
 if (!AUTHOR) {
   const pb = $("ptsBtn");
-  pb.textContent = "☰ Chapters";
+  pb.textContent = "Chapters";
   pb.title = "Jump to a place";
   pb.addEventListener("click", () => {
     $("pts").hidden = !$("pts").hidden;
@@ -2149,7 +2821,7 @@ function seriesModel(tab) {
   if (tab === "height") return [{ key: "y", color: "#6ee7a8", unit: " m", dec: 2, curve: yC, nodes: nodes((w) => w.p[1]) }];
   const eul = (w) => _ge.setFromQuaternion(_gq.set(...w.q), "YXZ");
   return [
-    { key: "yaw", color: "#ffb454", unit: "°", dec: 0, curve: yawC, nodes: nodes((w, i) => { const b = eul(w).y * R2D; return b + 360 * Math.round((yawC[idx(wpT[i])] - b) / 360); }) },
+    { key: "yaw", color: "#f5f3f1", unit: "°", dec: 0, curve: yawC, nodes: nodes((w, i) => { const b = eul(w).y * R2D; return b + 360 * Math.round((yawC[idx(wpT[i])] - b) / 360); }) },
     { key: "pitch", color: "#7cc4ff", unit: "°", dec: 0, curve: pitC, nodes: nodes((w) => eul(w).x * R2D) },
   ];
 }
@@ -2307,8 +2979,8 @@ function drawSpeed() {
   // the speed curve itself
   c.beginPath();
   for (let k = 0; k <= 240; k++) { const t = k / 240, x = X(t), y = Y(Math.max(m.at(t), 0)); k ? c.lineTo(x, y) : c.moveTo(x, y); }
-  c.strokeStyle = "#ffb454"; c.lineWidth = 2; c.stroke();
-  c.lineTo(X(1), g.y0); c.lineTo(X(0), g.y0); c.closePath(); c.fillStyle = "#ffb45422"; c.fill();
+  c.strokeStyle = "#f5f3f1"; c.lineWidth = 2; c.stroke();
+  c.lineTo(X(1), g.y0); c.lineTo(X(0), g.y0); c.closePath(); c.fillStyle = "#f5f3f11f"; c.fill();
   // hovering or dragging the curve between two points: that stretch is shaded, with its average speed and time
   m.segs.forEach((s) => {
     const hot = (speedHover && speedHover.kind === "seg" && speedHover.i === s.i) || (speedDrag && speedDrag.kind === "seg" && speedDrag.i === s.i);
@@ -2747,11 +3419,11 @@ function setPreview(on) {
   const pb = $("ptsBtn");
   document.body.classList.toggle("author", !on);
   document.body.classList.toggle("previewing", on);
-  $("prevBtn").textContent = on ? "✕ Exit preview" : "👁 Preview";
+  $("prevBtn").textContent = on ? "Exit preview" : "Preview";
   $("prevBtn").classList.toggle("on", on);
   $("editBtn").hidden = on;
   $("author").hidden = on;
-  pb.textContent = on ? "☰ Chapters" : "☰ Points";
+  pb.textContent = on ? "Chapters" : "Points";
   pb.classList.remove("on");
   if (on) {
     $("pts").hidden = true;
