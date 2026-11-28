@@ -57,7 +57,7 @@ import { SparkRenderer, SparkControls, SplatMesh, dyno } from "@sparkjsdev/spark
 
 // ---- defaults (every one of these is also a slider in the ⚙ panel) -------------------------
 const params = new URLSearchParams(location.search);
-const SPLAT_URL = params.get("splat") || "./cleaned-up-splat-v11.spz";
+let SPLAT_URL = params.get("splat") || "./cleaned-up-splat-v11.spz";   // replaced below by config.json (same R2 link your main site uses)
 const ORIENTATION_DEG = [-90, 0, 0];   // same as your site's orientation 3
 const MAX_POINTS = 64;                 // how many places it remembers (compile-time, more = heavier)
 
@@ -514,6 +514,21 @@ buildPanel();
 
 // ---- load ---------------------------------------------------------------------------------
 async function load() {
+  // same rule as your main site: the splat URL comes from config.json (your Cloudflare R2 link)
+  if (!params.get("splat")) {
+    try {
+      const cfg = await (await fetch("./config.json", { cache: "no-store" })).json();
+      if (cfg.splat) SPLAT_URL = cfg.splat;
+    } catch {}
+  }
+  // testing on your own computer: use the local copy instead of downloading from R2 each time (add ?remote to force R2)
+  if (/^(localhost|127\.0\.0\.1)$/.test(location.hostname) && /^https?:/.test(SPLAT_URL) && !params.has("remote")) {
+    const local = "./" + decodeURIComponent(SPLAT_URL.split("?")[0].split("/").pop());
+    try {
+      const r = await fetch(local, { method: "HEAD", cache: "no-store" });
+      if (r.ok && +(r.headers.get("content-length") || 1) > 1e6) SPLAT_URL = local;
+    } catch {}
+  }
   // authored start of your fly-through (world coordinates)
   let start = { p: [0, 1.5, 0], q: [0, 0, 0, 1] };
   try {
